@@ -12,6 +12,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -261,6 +262,28 @@ def fmt_price(chaos: float, divine_rate: float | None, key: str) -> tuple[str, s
     return f"{fmt_num(chaos)} c", FG_ACCENT
 
 
+# Word-level abbreviations for unique variant labels, so the hint fits on the item's row.
+ABBREVIATIONS = {
+    "Requirements": "Req", "Requirement": "Req", "Level": "Lvl", "Physical": "Phys", "Elemental": "Ele",
+    "Lightning": "Light", "Projectiles": "Proj", "Projectile": "Proj", "Damage": "Dmg", "Resistances": "Res",
+    "Resistance": "Res", "Resist": "Res", "Duration": "Dur", "Reduction": "Red", "Recovery": "Rec",
+    "Multi": "Mult", "Chance": "Chc", "Maximum": "Max", "Minimum": "Min", "Intelligence": "Int",
+    "Strength": "Str", "Dexterity": "Dex", "Accuracy": "Acc", "Endurance": "End", "Evasion": "Eva",
+    "Suppressed": "Supp", "Suppress": "Supp", "Cooldown": "CD", "Movement": "Move", "Notables": "Not.",
+}
+SUB_MAX_CHARS = 22
+
+
+def abbreviate(text: str, limit: int = SUB_MAX_CHARS) -> str:
+    """Shorten a variant label word by word; cut with an ellipsis if it is still too long."""
+    if len(text) <= limit:
+        return text
+    short = re.sub(r"[A-Za-z]+", lambda m: ABBREVIATIONS.get(m.group(0), m.group(0)), text)
+    if len(short) > limit:
+        short = short[:limit - 1].rstrip(" ,") + "…"
+    return short
+
+
 def describe_error(e: Exception) -> str:
     if isinstance(e, urllib.error.HTTPError):
         return f"HTTP {e.code}"
@@ -409,17 +432,18 @@ class App:
     # -- multi-column layout ---------------------------------------------------------
     def _column_min_width(self, items: list[Item]) -> int:
         f_name = tkfont.Font(font=self._font())
-        f_sub = tkfont.Font(font=self._font(-4))
+        f_sub = tkfont.Font(font=self._font(-3))
         f_price = tkfont.Font(font=self._font(bold=True))
         f_ch = tkfont.Font(font=self._font(-3))
-        names = [f_name.measure(it.name) for it in items] or [f_name.measure("Mirror of Kalandra")]
-        subs = [f_sub.measure(it.sub) for it in items if it.sub] or [0]
-        w = max(max(names), max(subs)) + 12
+        # paddings mirror _row(): name padx 6, sub padx 8+4, price padx 6+6, change padx 4+4
+        widths = [f_name.measure(it.name) + 6 + (f_sub.measure(abbreviate(it.sub)) + 12 if it.sub else 0)
+                  for it in items] or [f_name.measure("Mirror of Kalandra") + 6]
+        w = max(widths)
         w += f_price.measure("9999 div") + 12
-        w += f_ch.measure("-100.0%") + 8
+        w += max(f_ch.measure("-100.0%"), f_ch.measure("0" * 8)) + 8
         if self.cfg.show_icons:
             w += self._icon_px() + 8
-        return w + 24  # inter-column gap
+        return w + 12 + 16  # inter-column gap + safety margin
 
     def _on_body_resize(self, _evt=None):
         if self.resize_job:
@@ -492,17 +516,14 @@ class App:
             ic.grid(row=r, column=0, sticky="nsew")
             self.row_widgets.append(ic)
 
+        cell = tk.Frame(frame, bg=bg)
+        cell.grid(row=r, column=1, sticky="nsew")
+        tk.Label(cell, text=item.name, bg=bg, fg=FG, font=self._font(), anchor="w").pack(side="left", padx=(6, 0))
         if item.sub:
-            cell = tk.Frame(frame, bg=bg)
-            cell.grid(row=r, column=1, sticky="nsew")
-            tk.Label(cell, text=item.name, bg=bg, fg=FG, font=self._font(), anchor="w", padx=6).pack(fill="x")
-            tk.Label(cell, text=item.sub, bg=bg, fg=FG_DIM, font=self._font(-4), anchor="w",
-                     padx=6).pack(fill="x", pady=(0, 2))
-            self.row_widgets.append(cell)
-        else:
-            name = tk.Label(frame, text=item.name, bg=bg, fg=FG, font=self._font(), anchor="w", padx=6)
-            name.grid(row=r, column=1, sticky="nsew")
-            self.row_widgets.append(name)
+            # variant / link count on the same line, dimmed, so every row has the same height
+            tk.Label(cell, text=abbreviate(item.sub), bg=bg, fg=FG_DIM, font=self._font(-3),
+                     anchor="s").pack(side="left", fill="y", padx=(8, 4))
+        self.row_widgets.append(cell)
 
         price_txt, price_fg = fmt_price(item.chaos, snap.divine_rate, item.key)
         price = tk.Label(frame, text=price_txt, bg=bg, fg=price_fg, font=self._font(bold=True),
