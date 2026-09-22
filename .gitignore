@@ -11,3 +11,7 @@ __pycache__/
 .vscode/
 .idea/
 Thumbs.db
+
+# local price history (per user)
+history.json
+history.json.tmp

@@ -2,6 +2,8 @@
 
 Single-file tkinter app, standard library only. Shows selected currency and
 unique item prices for a Path of Exile league with periodic auto-refresh.
+Price changes over 1h/6h/24h are computed from a local history recorded on
+every refresh (poe.ninja only publishes daily history); 7d comes from poe.ninja.
 
 Run without a console window:  pythonw poedeck.py
 Hotkeys: F5 refresh, Ctrl+, open settings.
@@ -27,6 +29,7 @@ from tkinter import ttk
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_DIR = os.path.join(APP_DIR, "icons")
+HISTORY_PATH = os.path.join(APP_DIR, "history.json")
 
 API_BASE = "https://poe.ninja/poe1/api/economy"
 LEAGUES_URL = f"{API_BASE}/leagues"
@@ -60,6 +63,19 @@ DEFAULT_SELECTED = [
 
 MAX_LIST_ROWS = 200  # settings list cap; uniques categories have ~900 entries
 
+# Price-change windows. "7d" is poe.ninja's own weekly figure; the others come from
+# the local price history this app records on every refresh.
+CHANGE_WINDOWS: list[tuple[str, str, int | None]] = [
+    ("7d", "7d (poe.ninja)", None),
+    ("24h", "24h", 24 * 3600),
+    ("6h", "6h", 6 * 3600),
+    ("1h", "1h", 3600),
+]
+CHANGE_LABEL = {code: label for code, label, _ in CHANGE_WINDOWS}
+CHANGE_SECONDS = {code: secs for code, _, secs in CHANGE_WINDOWS}
+HISTORY_KEEP_S = 3 * 24 * 3600   # retention of local price points
+HISTORY_MIN_GAP_S = 4 * 60       # do not store points closer than this (manual refreshes)
+
 # Dark palette
 BG = "#15171c"
 BG_ROW = "#1c1f26"
@@ -80,11 +96,12 @@ SCROLL = "#3a3f4b"
 class Config:
     league: str = AUTO_LEAGUE
     selected: list[str] = field(default_factory=lambda: list(DEFAULT_SELECTED))  # "<Category>:<id>"
-    interval_min: int = 5
+    interval_min: int = 10
     font_size: int = 14
     geometry: str = "460x360+100+100"
     always_on_top: bool = False
     show_icons: bool = True
+    change_window: str = "24h"   # one of CHANGE_WINDOWS codes
 
     @classmethod
     def load(cls) -> "Config":
@@ -98,6 +115,8 @@ class Config:
         except (OSError, json.JSONDecodeError):
             pass
         cfg.interval_min = max(1, int(cfg.interval_min))
+        if cfg.change_window not in CHANGE_SECONDS:
+            cfg.change_window = "24h"
         # migrate v0.1 configs that stored bare currency ids
         cfg.selected = [k if ":" in k else f"{CURRENCY}:{k}" for k in cfg.selected]
         return cfg
@@ -141,6 +160,68 @@ class Snapshot:
     def get(self, key: str) -> Item | None:
         cat = key.split(":", 1)[0]
         return self.items.get(cat, {}).get(key)
+
+
+class History:
+    """Local price history: league -> item key -> [[timestamp, chaos], ...] (oldest first).
+
+    poe.ninja only exposes daily history, so short change windows are computed from the
+    prices this app itself observed. The newest point survives restarts, so after a restart
+    the change is measured against the last price seen in the previous session.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.data: dict[str, dict[str, list[list[float]]]] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                self.data = raw
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def record(self, league: str, items: list["Item"], ts: float) -> None:
+        per_league = self.data.setdefault(league, {})
+        for it in items:
+            pts = per_league.setdefault(it.key, [])
+            if pts and ts - pts[-1][0] < HISTORY_MIN_GAP_S:
+                continue
+            pts.append([ts, it.chaos])
+            # drop points older than the retention window, but always keep the newest of them
+            # so a change can still be measured after a long pause or a restart
+            cutoff = ts - HISTORY_KEEP_S
+            while len(pts) > 1 and pts[1][0] < cutoff:
+                pts.pop(0)
+        self.save()
+
+    def change(self, league: str, key: str, chaos_now: float, window_s: int, now: float) -> tuple[float | None, bool]:
+        """Return (percent change, approximate) against the stored point closest to `now - window_s`.
+
+        The point recorded in the current refresh is ignored. If the closest point's age differs
+        from the window by more than 20 %, `approximate` is True (rendered with a "~").
+        """
+        pts = self.data.get(league, {}).get(key)
+        if not pts:
+            return None, False
+        target = now - window_s
+        candidates = [pt for pt in pts if pt[0] <= now - HISTORY_MIN_GAP_S]
+        if not candidates:
+            return None, False
+        ref_ts, ref_chaos = min(candidates, key=lambda pt: abs(pt[0] - target))
+        if ref_chaos <= 0:
+            return None, False
+        approx = abs((now - ref_ts) - window_s) > 0.2 * window_s
+        return (chaos_now / ref_chaos - 1.0) * 100.0, approx
+
+    def save(self) -> None:
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, separators=(",", ":"))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
 
 def http_get_json(url: str):
@@ -248,11 +329,11 @@ def fmt_num(v: float) -> str:
     return f"{v:.4f}"
 
 
-def fmt_change(c: float | None) -> str:
+def fmt_change(c: float | None, approx: bool = False) -> str:
     if c is None:
-        return ""
+        return "—"
     sign = "+" if c > 0 else ""
-    return f"{sign}{c:.1f}%"
+    return f"{'~' if approx else ''}{sign}{c:.1f}%"
 
 
 def fmt_price(chaos: float, divine_rate: float | None, key: str) -> tuple[str, str]:
@@ -301,6 +382,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.cfg = Config.load()
+        self.history = History(HISTORY_PATH)
         self.snapshot: Snapshot | None = None
         self.leagues: list[str] = []
         self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -483,6 +565,10 @@ class App:
                            bg=BG, fg=FG_DIVINE, font=self._font(-2, bold=True), anchor="w")
             lbl.grid(row=0, column=0, columnspan=cols, sticky="w", pady=(0, 6))
             self.row_widgets.append(lbl)
+        win_lbl = tk.Label(self.body, text=f"\u0394 {self.cfg.change_window}", bg=BG, fg=FG_DIM,
+                           font=self._font(-4), anchor="e")
+        win_lbl.grid(row=0, column=cols - 1, sticky="e", pady=(0, 6))
+        self.row_widgets.append(win_lbl)
 
         per_col = math.ceil(len(present) / cols) if present else 0
         for c in range(cols):
@@ -530,12 +616,18 @@ class App:
                          anchor="e", padx=6)
         price.grid(row=r, column=2, sticky="nsew")
 
-        ch = item.change_7d
+        ch, approx = self._change(snap, item)
         ch_fg = FG_DIM if ch is None or abs(ch) < 0.05 else (FG_UP if ch > 0 else FG_DOWN)
-        change = tk.Label(frame, text=fmt_change(ch), bg=bg, fg=ch_fg, font=self._font(-3),
+        change = tk.Label(frame, text=fmt_change(ch, approx), bg=bg, fg=ch_fg, font=self._font(-3),
                           anchor="e", width=8, padx=4)
         change.grid(row=r, column=3, sticky="nsew")
         self.row_widgets.extend((price, change))
+
+    def _change(self, snap: Snapshot, item: Item) -> tuple[float | None, bool]:
+        window_s = CHANGE_SECONDS.get(self.cfg.change_window)
+        if window_s is None:
+            return item.change_7d, False
+        return self.history.change(snap.league, item.key, item.chaos, window_s, snap.updated_at)
 
     # -- fetching ----------------------------------------------------------------------
     def _selected_categories(self) -> set[str]:
@@ -603,6 +695,8 @@ class App:
                                 snap.items[cat] = items
                                 snap.fetched[cat] = self.snapshot.fetched.get(cat, 0.0)
                     self.snapshot = snap
+                    present = [it for it in (snap.get(k) for k in self.cfg.selected) if it is not None]
+                    self.history.record(snap.league, present, snap.updated_at)
                     self.status_var.set(time.strftime("%H:%M", time.localtime(snap.updated_at)))
                     self.fetching = False
                     self._maybe_relayout(force=True)
@@ -622,6 +716,8 @@ class App:
                     if self.snapshot and self.snapshot.league == league:
                         self.snapshot.items[cat] = items
                         self.snapshot.fetched[cat] = time.time()
+                        newly = [items[k] for k in self.cfg.selected if k in items]
+                        self.history.record(league, newly, self.snapshot.updated_at)
                         self._maybe_relayout(force=True)
                         self._sync_settings_list()
                 elif kind == "category_error":
@@ -695,6 +791,12 @@ class App:
         tk.Label(opts, text="Font:", bg=BG, fg=FG_DIM, font=self._font(-3)).pack(side="left", padx=(10, 0))
         self.font_var = tk.StringVar(value=str(self.cfg.font_size))
         self._spin(opts, self.font_var, 8, 40, 3).pack(side="left", padx=6)
+        tk.Label(opts, text="Change:", bg=BG, fg=FG_DIM, font=self._font(-3)).pack(side="left", padx=(10, 0))
+        self.change_var = tk.StringVar(value=CHANGE_LABEL[self.cfg.change_window])
+        change_box = ttk.Combobox(opts, textvariable=self.change_var, state="readonly", width=13,
+                                  values=[label for _, label, _ in CHANGE_WINDOWS], font=self._font(-3))
+        change_box.pack(side="left", padx=6)
+        change_box.bind("<<ComboboxSelected>>", lambda e: self._apply_options())
 
         opts2 = tk.Frame(win, bg=BG, padx=8, pady=4)
         opts2.pack(fill="x")
@@ -755,9 +857,13 @@ class App:
         self.cfg.always_on_top = bool(self.topmost_var.get())
         self.root.attributes("-topmost", self.cfg.always_on_top)
         new_icons = bool(self.icons_var.get())
-        if new_font != self.cfg.font_size or new_icons != self.cfg.show_icons:
+        new_window = next((code for code, label, _ in CHANGE_WINDOWS if label == self.change_var.get()),
+                          self.cfg.change_window)
+        if (new_font != self.cfg.font_size or new_icons != self.cfg.show_icons
+                or new_window != self.cfg.change_window):
             self.cfg.font_size = new_font
             self.cfg.show_icons = new_icons
+            self.cfg.change_window = new_window
             self._maybe_relayout(force=True)
         self.cfg.save()
         if not self.fetching:
