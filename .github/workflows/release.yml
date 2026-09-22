@@ -64,11 +64,16 @@ jobs:
         shell: bash
         run: |
           # start it, give it a few seconds, make sure the process is alive, then stop it
+          export POEDECK_PATHS_FILE="$PWD/paths.json"
           ./build/main.dist/PoeDeck.exe & pid=$!
           sleep 8
-          if ! kill -0 $pid 2>/dev/null; then echo "::error::PoeDeck.exe exited early"; exit 1; fi
-          kill $pid || true
+          alive=0; kill -0 $pid 2>/dev/null && alive=1
+          kill $pid 2>/dev/null || true
           sleep 1
+          echo "== path diagnostics written by the app:"; cat paths.json 2>/dev/null || echo "(no paths.json)"
+          echo "== non-library files in main.dist:"; ls build/main.dist | grep -vE '\.(dll|pyd)$' || true
+          echo "== %LOCALAPPDATA%/PoeDeck:"; ls "$LOCALAPPDATA/PoeDeck" 2>/dev/null || echo "(absent)"
+          if [ "$alive" != 1 ]; then echo "::error::PoeDeck.exe exited early"; exit 1; fi
           # the app must have created its data files next to the exe
           ls build/main.dist | grep -E "poedeck.log|config.json" || { echo "::error::no data files next to exe"; exit 1; }
           cat build/main.dist/poedeck.log

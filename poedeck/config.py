@@ -73,6 +73,27 @@ def resource_path(*parts: str) -> str:
 
 
 APP_DIR = _resolve_app_dir()
+
+
+def debug_paths() -> dict:
+    """Everything that went into choosing APP_DIR; written to $POEDECK_PATHS_FILE at startup when set."""
+    info = _nuitka_info()
+    return {
+        "is_frozen": is_frozen(),
+        "executable_dir": executable_dir(),
+        "app_dir": APP_DIR,
+        "source_root": SOURCE_ROOT,
+        "sys_executable": sys.executable,
+        "sys_argv0": sys.argv[0] if sys.argv else "",
+        "config_file": __file__,
+        "sys_frozen": getattr(sys, "frozen", None),
+        "nuitka": repr(info) if info is not None else None,
+        "nuitka_env": {k: v for k, v in os.environ.items() if k.startswith("NUITKA_")},
+        "localappdata": os.environ.get("LOCALAPPDATA"),
+        "cwd": os.getcwd(),
+    }
+
+
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_DIR = os.path.join(APP_DIR, "icons")
 HISTORY_PATH = os.path.join(APP_DIR, "history.json")

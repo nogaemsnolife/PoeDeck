@@ -16,7 +16,7 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 from .config import (AUTO_LEAGUE, CATEGORIES, CATEGORY_LABEL, CHANGE_LABEL, CHANGE_SECONDS, CHANGE_WINDOWS,
-                     APP_DIR, APP_ICON, CONFIG_PATH, CURRENCY, HISTORY_PATH, LIVE_HIT_TTL_S, LIVE_MAX_HITS,
+                     APP_DIR, APP_ICON, CONFIG_PATH, CURRENCY, HISTORY_PATH, debug_paths, LIVE_HIT_TTL_S, LIVE_MAX_HITS,
                      LIVE_POPUP_SECONDS, LOG_PATH, MAX_LIST_ROWS, MAX_LIVE_SEARCHES, Config)
 from . import __version__
 from .format import abbreviate, fmt_change, fmt_num, fmt_price
@@ -1004,6 +1004,14 @@ def setup_logging():
 
 
 def main():
+    paths_file = os.environ.get("POEDECK_PATHS_FILE")
+    if paths_file:  # packaging diagnostics: dump how the data directory was resolved
+        try:
+            import json
+            with open(paths_file, "w", encoding="utf-8") as f:
+                json.dump(debug_paths(), f, indent=1, default=str)
+        except OSError:
+            pass
     setup_logging()
     if sys.platform == "win32":
         try:
