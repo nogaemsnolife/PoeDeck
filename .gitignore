@@ -18,3 +18,12 @@ history.json.tmp
 
 # runtime log
 poedeck.log*
+
+# packaging output
+build/
+build-*/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.spec

@@ -5,7 +5,18 @@ Pulls currency and unique item prices from [poe.ninja](https://poe.ninja) and re
 on a timer, and can watch official trade site live searches. Pure Python, standard library only,
 ~50 MB RAM, idle CPU near zero.
 
-## Run
+## Download
+
+Prebuilt Windows builds are on the [Releases](https://github.com/nogaemsnolife/PoeDeck/releases) page.
+Unpack the zip anywhere and run `PoeDeck.exe`; no installation and no Python needed. The app is
+portable: `config.json`, `history.json`, `icons/` and the log are created next to the exe, so a new
+version unpacked over the old one keeps your settings. If that folder is read-only (e.g. Program
+Files), data goes to `%LOCALAPPDATA%\PoeDeck` instead.
+
+The executable is not code-signed, so Windows SmartScreen warns on first launch: choose
+"More info" → "Run anyway".
+
+## Run from source
 
 Requires Python 3.10+ with tkinter (included in the standard Windows installer).
 
@@ -48,6 +59,8 @@ pythonw main.py
 | `poedeck/ninja.py` | poe.ninja data layer and local price history |
 | `poedeck/trade.py` | trade site live search: WebSocket client, listing fetch, rate limiting |
 | `poedeck/config.py`, `poedeck/format.py` | settings and constants, text formatting |
+| `assets/poedeck.ico` | application icon |
+| `.github/workflows/` | CI on every push; a `v*` tag builds the exe with Nuitka and publishes a release |
 | `config.json` | created on first run; league, selected items, options, live searches, POESESSID |
 | `icons/` | cached item icons |
 | `history.json` | local price history for the 1h/6h/24h change windows (3 days retention) |
@@ -58,6 +71,13 @@ pythonw main.py
 poe.ninja has no documented public API; the endpoints used here are the ones the site itself calls
 (`/poe1/api/economy/...`). If they change, the URL constants at the top of `poedeck.py` are the only
 place to update.
+
+### Making a release
+
+Bump `__version__` in `poedeck/__init__.py`, commit, then tag and push: `git tag v0.4.0 && git push origin v0.4.0`.
+GitHub Actions builds `PoeDeck.exe`, zips it with README and LICENSE and attaches it to the release
+with generated notes. Running the workflow manually ("Run workflow" button) builds the same zip as a
+downloadable artifact without publishing a release.
 
 The trade API is rate limited per IP; the app reads the `X-Rate-Limit-*` headers and backs off.
 Running many other trade tools at the same time can still trigger a temporary block.

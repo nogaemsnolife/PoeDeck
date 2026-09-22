@@ -16,8 +16,9 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 from .config import (AUTO_LEAGUE, CATEGORIES, CATEGORY_LABEL, CHANGE_LABEL, CHANGE_SECONDS, CHANGE_WINDOWS,
-                     CURRENCY, HISTORY_PATH, LIVE_HIT_TTL_S, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, LOG_PATH,
-                     MAX_LIST_ROWS, MAX_LIVE_SEARCHES, Config)
+                     APP_DIR, APP_ICON, CONFIG_PATH, CURRENCY, HISTORY_PATH, LIVE_HIT_TTL_S, LIVE_MAX_HITS,
+                     LIVE_POPUP_SECONDS, LOG_PATH, MAX_LIST_ROWS, MAX_LIVE_SEARCHES, Config)
+from . import __version__
 from .format import abbreviate, fmt_change, fmt_num, fmt_price
 from .ninja import (History, Item, Snapshot, describe_error, download_icons, fetch_currency, fetch_leagues,
                     fetch_uniques, pick_softcore_league)
@@ -81,6 +82,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.cfg = Config.load()
+        if not os.path.exists(CONFIG_PATH):
+            self.cfg.save()  # make the data location visible from the first start
         self.history = History(HISTORY_PATH)
         self.snapshot: Snapshot | None = None
         self.leagues: list[str] = []
@@ -997,6 +1000,7 @@ def setup_logging():
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.getLogger("poedeck").setLevel(logging.INFO)
     logging.getLogger("poedeck").addHandler(handler)
+    logging.getLogger("poedeck").info("PoeDeck %s starting, data dir %s", __version__, APP_DIR)
 
 
 def main():
@@ -1008,5 +1012,10 @@ def main():
         except Exception:  # noqa: BLE001 - older Windows without shcore
             pass
     root = tk.Tk()
+    if os.path.exists(APP_ICON):
+        try:
+            root.iconbitmap(default=APP_ICON)
+        except tk.TclError:
+            pass
     App(root)
     root.mainloop()

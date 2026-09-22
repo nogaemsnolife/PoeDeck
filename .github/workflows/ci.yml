@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile
+        run: python -m compileall -q main.py poedeck
+      - name: Import and smoke tests
+        run: |
+          python -c "import poedeck.ui, poedeck.trade, poedeck.ninja; print('imports ok')"
+          python - <<'EOF'
+          import time
+          from poedeck import trade, format as fmt, ninja
+          s = trade.LiveSearch.from_url("https://www.pathofexile.com/trade/search/Standard/abc123/live", "t")
+          assert s and s.league == "Standard" and s.id == "abc123"
+          assert trade.LiveSearch.from_url("https://poe.ninja/") is None
+          assert fmt.fmt_price(400, 368, "UniqueArmour:x") == ("1.09 div", True)
+          assert fmt.fmt_change(None) == "—" and fmt.fmt_change(-2.34, True) == "~-2.3%"
+          assert fmt.abbreviate("Gem Level, Blue Requirements") == "Gem Lvl, Blue Req"
+          h = ninja.History("history-test.json")
+          it = ninja.Item(key="Currency:divine", category="Currency", name="Divine", sub="", group="",
+                          chaos=369.0, change_7d=None, icon_url="")
+          now = time.time()
+          h.data = {"L": {"Currency:divine": [[now - 5 * 24 * 3600, 200.0]]}}
+          h.record("L", [it], now)
+          pct, approx = h.change("L", "Currency:divine", 369.0, 86400, now)
+          assert approx and abs(pct - 84.5) < 0.1, (pct, approx)
+          print("smoke tests ok")
+          EOF
+        shell: bash

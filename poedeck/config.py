@@ -3,15 +3,83 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 
-APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from . import __version__
+
+SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _nuitka_info():
+    """Nuitka defines __compiled__ in the main module (and compiled modules); None when running from source."""
+    main = sys.modules.get("__main__")
+    return getattr(main, "__compiled__", None) or globals().get("__compiled__")
+
+
+def is_frozen() -> bool:
+    """True when running as a packaged executable (PyInstaller sets sys.frozen, Nuitka defines __compiled__)."""
+    return bool(getattr(sys, "frozen", False)) or _nuitka_info() is not None
+
+
+def executable_dir() -> str | None:
+    """Directory of the packaged executable, or None from source.
+
+    Nuitka onefile: sys.executable is the python.exe extracted to a temp folder, so the real
+    location comes from __compiled__.containing_dir / NUITKA_ONEFILE_DIRECTORY. PyInstaller
+    onefile: sys.executable is the bundle itself.
+    """
+    info = _nuitka_info()
+    if info is not None:
+        d = getattr(info, "containing_dir", None) or os.environ.get("NUITKA_ONEFILE_DIRECTORY")
+        if d:
+            return os.path.abspath(d)
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return None
+
+
+def _writable(path: str) -> bool:
+    try:
+        probe = os.path.join(path, ".poedeck-write-test")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_app_dir() -> str:
+    """Where user data lives: next to the executable (portable), or %LOCALAPPDATA%/PoeDeck if that is read-only.
+
+    Keeping data beside the exe means unpacking a new version over the old one preserves
+    config.json, history.json, icons/ and the log.
+    """
+    base = executable_dir() or SOURCE_ROOT
+    if _writable(base):
+        return base
+    fallback = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "PoeDeck")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def resource_path(*parts: str) -> str:
+    """Path of a read-only file bundled with the app (PyInstaller unpacks to sys._MEIPASS,
+    Nuitka onefile keeps package files next to this module's extracted copy)."""
+    base = getattr(sys, "_MEIPASS", None) or SOURCE_ROOT
+    return os.path.join(base, *parts)
+
+
+APP_DIR = _resolve_app_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_DIR = os.path.join(APP_DIR, "icons")
 HISTORY_PATH = os.path.join(APP_DIR, "history.json")
 LOG_PATH = os.path.join(APP_DIR, "poedeck.log")
+APP_ICON = resource_path("assets", "poedeck.ico")
 
-USER_AGENT = "PoeDeck/0.3 (github.com/nogaemsnolife/PoeDeck)"
+USER_AGENT = f"PoeDeck/{__version__} (github.com/nogaemsnolife/PoeDeck)"
 HTTP_TIMEOUT = 30
 
 AUTO_LEAGUE = "auto"  # sentinel: pick the current softcore challenge league

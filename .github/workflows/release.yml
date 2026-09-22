@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v0.4.0 to build a standalone Windows executable with Nuitka and
+# publish it on the GitHub release for that tag. "workflow_dispatch" builds the
+# same package as a downloadable artifact without creating a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Nuitka
+        run: pip install nuitka ordered-set zstandard
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          pkg=$(python -c "import poedeck; print(poedeck.__version__)")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag" != "$pkg" ]]; then
+              echo "::error::tag v$tag does not match poedeck.__version__ = $pkg"; exit 1
+            fi
+          fi
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Build executable
+        shell: bash
+        run: |
+          python -m nuitka main.py \
+            --onefile \
+            --assume-yes-for-downloads \
+            --windows-console-mode=disable \
+            --enable-plugin=tk-inter \
+            --windows-icon-from-ico=assets/poedeck.ico \
+            --include-data-files=assets/poedeck.ico=assets/poedeck.ico \
+            --company-name=nogaemsnolife \
+            --product-name=PoeDeck \
+            --file-version="${{ steps.ver.outputs.version }}" \
+            --product-version="${{ steps.ver.outputs.version }}" \
+            --file-description="PoeDeck - Path of Exile price dashboard" \
+            --output-filename=PoeDeck.exe \
+            --output-dir=build
+
+      - name: Smoke-run the executable
+        shell: bash
+        run: |
+          # start it, give it a few seconds, make sure the process is alive, then stop it
+          ./build/PoeDeck.exe & pid=$!
+          sleep 8
+          if ! kill -0 $pid 2>/dev/null; then echo "::error::PoeDeck.exe exited early"; exit 1; fi
+          kill $pid || true
+          test -f build/poedeck.log && cat build/poedeck.log || echo "(no log written next to exe)"
+
+      - name: Package
+        shell: bash
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          mkdir -p dist/PoeDeck
+          cp build/PoeDeck.exe README.md LICENSE dist/PoeDeck/
+          cd dist && 7z a -tzip "PoeDeck-v$v-windows-x64.zip" PoeDeck >/dev/null
+          sha256sum "PoeDeck-v$v-windows-x64.zip" > "PoeDeck-v$v-windows-x64.zip.sha256"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoeDeck-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
