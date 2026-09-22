@@ -1,80 +1,24 @@
-"""PoeDeck - minimal poe.ninja price dashboard for a small secondary monitor.
-
-Single-file tkinter app, standard library only. Shows selected currency and
-unique item prices for a Path of Exile league with periodic auto-refresh.
-Price changes over 1h/6h/24h are computed from a local history recorded on
-every refresh (poe.ninja only publishes daily history); 7d comes from poe.ninja.
-
-Run without a console window:  pythonw poedeck.py
-Hotkeys: F5 refresh, Ctrl+, open settings.
-"""
+"""tkinter user interface: main dashboard window, settings window, live-search panel and popups."""
 from __future__ import annotations
 
-import json
 import math
 import os
 import queue
-import re
 import sys
 import threading
 import time
 import tkinter as tk
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass, field
+import webbrowser
 from tkinter import font as tkfont
 from tkinter import ttk
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-ICON_DIR = os.path.join(APP_DIR, "icons")
-HISTORY_PATH = os.path.join(APP_DIR, "history.json")
-
-API_BASE = "https://poe.ninja/poe1/api/economy"
-LEAGUES_URL = f"{API_BASE}/leagues"
-CURRENCY_URL = f"{API_BASE}/exchange/current/overview?league={{league}}&type=Currency"
-ITEM_URL = f"{API_BASE}/stash/current/item/overview?league={{league}}&type={{type}}"
-IMAGE_HOST = "https://web.poecdn.com"  # currency image paths in the API are relative to this host
-USER_AGENT = "PoeDeck/0.2 (personal dashboard; tkinter)"
-HTTP_TIMEOUT = 30
-
-AUTO_LEAGUE = "auto"  # sentinel: pick the current softcore challenge league
-CURRENCY = "Currency"
-
-# (API type, human label). Order is used in the settings category dropdown.
-CATEGORIES: list[tuple[str, str]] = [
-    (CURRENCY, "Currency"),
-    ("UniqueWeapon", "Unique Weapons"),
-    ("UniqueArmour", "Unique Armours"),
-    ("UniqueAccessory", "Unique Accessories"),
-    ("UniqueFlask", "Unique Flasks"),
-    ("UniqueJewel", "Unique Jewels"),
-    ("UniqueMap", "Unique Maps"),
-    ("UniqueRelic", "Unique Relics"),
-    ("UniqueTincture", "Unique Tinctures"),
-]
-CATEGORY_LABEL = dict(CATEGORIES)
-
-DEFAULT_SELECTED = [
-    f"{CURRENCY}:divine", f"{CURRENCY}:exalted", f"{CURRENCY}:mirror", f"{CURRENCY}:ancient-orb",
-    f"{CURRENCY}:annul", f"{CURRENCY}:fracturing-orb", f"{CURRENCY}:sacred-orb",
-]
-
-MAX_LIST_ROWS = 200  # settings list cap; uniques categories have ~900 entries
-
-# Price-change windows. "7d" is poe.ninja's own weekly figure; the others come from
-# the local price history this app records on every refresh.
-CHANGE_WINDOWS: list[tuple[str, str, int | None]] = [
-    ("7d", "7d (poe.ninja)", None),
-    ("24h", "24h", 24 * 3600),
-    ("6h", "6h", 6 * 3600),
-    ("1h", "1h", 3600),
-]
-CHANGE_LABEL = {code: label for code, label, _ in CHANGE_WINDOWS}
-CHANGE_SECONDS = {code: secs for code, _, secs in CHANGE_WINDOWS}
-HISTORY_KEEP_S = 3 * 24 * 3600   # retention of local price points
-HISTORY_MIN_GAP_S = 4 * 60       # do not store points closer than this (manual refreshes)
+from .config import (AUTO_LEAGUE, CATEGORIES, CATEGORY_LABEL, CHANGE_LABEL, CHANGE_SECONDS, CHANGE_WINDOWS,
+                     CURRENCY, HISTORY_PATH, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, MAX_LIST_ROWS, MAX_LIVE_SEARCHES,
+                     Config)
+from .format import abbreviate, fmt_change, fmt_num, fmt_price
+from .ninja import (History, Item, Snapshot, describe_error, download_icons, fetch_currency, fetch_leagues,
+                    fetch_uniques, pick_softcore_league)
+from .trade import Listing, LiveManager, LiveSearch
 
 # Dark palette
 BG = "#15171c"
@@ -88,294 +32,44 @@ FG_DOWN = "#e06c6c"
 FG_DIVINE = "#8fc1ff"
 SCROLL = "#3a3f4b"
 
+LIVE_SETTINGS = "__live__"   # pseudo-category in the settings dropdown
+LIVE_SETTINGS_LABEL = "Live searches (trade site)"
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
-@dataclass
-class Config:
-    league: str = AUTO_LEAGUE
-    selected: list[str] = field(default_factory=lambda: list(DEFAULT_SELECTED))  # "<Category>:<id>"
-    interval_min: int = 10
-    font_size: int = 14
-    geometry: str = "460x360+100+100"
-    always_on_top: bool = False
-    show_icons: bool = True
-    change_window: str = "24h"   # one of CHANGE_WINDOWS codes
-
-    @classmethod
-    def load(cls) -> "Config":
-        cfg = cls()
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k, v in data.items():
-                if hasattr(cfg, k):
-                    setattr(cfg, k, v)
-        except (OSError, json.JSONDecodeError):
-            pass
-        cfg.interval_min = max(1, int(cfg.interval_min))
-        if cfg.change_window not in CHANGE_SECONDS:
-            cfg.change_window = "24h"
-        # migrate v0.1 configs that stored bare currency ids
-        cfg.selected = [k if ":" in k else f"{CURRENCY}:{k}" for k in cfg.selected]
-        return cfg
-
-    def save(self) -> None:
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.__dict__, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
+EDITABLE_CLASSES = ("Entry", "TEntry", "Spinbox", "TSpinbox")
+# (virtual event, Latin letter, Windows keycode, Cyrillic keysyms, chars incl. control codes)
+EDIT_SHORTCUTS = [
+    ("<<Paste>>", "v", 86, ("Cyrillic_ve", "Cyrillic_VE"), ("v", "V", "", "м", "М")),
+    ("<<Copy>>", "c", 67, ("Cyrillic_es", "Cyrillic_ES"), ("c", "C", "", "с", "С")),
+    ("<<Cut>>", "x", 88, ("Cyrillic_che", "Cyrillic_CHE"), ("x", "X", "", "ч", "Ч")),
+    ("<<SelectAll>>", "a", 65, ("Cyrillic_ef", "Cyrillic_EF"), ("a", "A", "", "ф", "Ф")),
+]
 
 
-# ----------------------------------------------------------------------------
-# Data layer
-# ----------------------------------------------------------------------------
-@dataclass
-class Item:
-    key: str            # "<Category>:<id>", stable across refreshes
-    category: str
-    name: str
-    sub: str            # secondary text: variant / link count
-    group: str          # currency: API category; uniques: base type
-    chaos: float
-    change_7d: float | None
-    icon_url: str
+def edit_action(keysym: str, keycode: int, char: str) -> str | None:
+    """Map a Ctrl+key press to a virtual edit event regardless of keyboard layout.
 
-    @property
-    def icon_file(self) -> str:
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.key.replace(":", "_"))
-        return os.path.join(ICON_DIR, safe + ".png")
-
-
-@dataclass
-class Snapshot:
-    league: str
-    divine_rate: float | None = None          # chaos per divine
-    items: dict[str, dict[str, Item]] = field(default_factory=dict)  # category -> key -> Item
-    fetched: dict[str, float] = field(default_factory=dict)          # category -> timestamp
-    updated_at: float = 0.0
-
-    def get(self, key: str) -> Item | None:
-        cat = key.split(":", 1)[0]
-        return self.items.get(cat, {}).get(key)
-
-
-class History:
-    """Local price history: league -> item key -> [[timestamp, chaos], ...] (oldest first).
-
-    poe.ninja only exposes daily history, so short change windows are computed from the
-    prices this app itself observed. The newest point survives restarts, so after a restart
-    the change is measured against the last price seen in the previous session.
+    Tk binds editing shortcuts to Latin keysyms, so with a Cyrillic layout Ctrl+V arrives as
+    Ctrl+Cyrillic_ve and does nothing. Returns None for Latin keysyms (Tk's own binding handles
+    those, and generating the event again would paste twice) and for unrelated keys.
     """
-
-    def __init__(self, path: str):
-        self.path = path
-        self.data: dict[str, dict[str, list[list[float]]]] = {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                self.data = raw
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    def record(self, league: str, items: list["Item"], ts: float) -> None:
-        per_league = self.data.setdefault(league, {})
-        for it in items:
-            pts = per_league.setdefault(it.key, [])
-            if pts and ts - pts[-1][0] < HISTORY_MIN_GAP_S:
-                continue
-            pts.append([ts, it.chaos])
-            # drop points older than the retention window, but always keep the newest of them
-            # so a change can still be measured after a long pause or a restart
-            cutoff = ts - HISTORY_KEEP_S
-            while len(pts) > 1 and pts[1][0] < cutoff:
-                pts.pop(0)
-        self.save()
-
-    def change(self, league: str, key: str, chaos_now: float, window_s: int, now: float) -> tuple[float | None, bool]:
-        """Return (percent change, approximate) against the stored point closest to `now - window_s`.
-
-        The point recorded in the current refresh is ignored. If the closest point's age differs
-        from the window by more than 20 %, `approximate` is True (rendered with a "~").
-        """
-        pts = self.data.get(league, {}).get(key)
-        if not pts:
-            return None, False
-        target = now - window_s
-        candidates = [pt for pt in pts if pt[0] <= now - HISTORY_MIN_GAP_S]
-        if not candidates:
-            return None, False
-        ref_ts, ref_chaos = min(candidates, key=lambda pt: abs(pt[0] - target))
-        if ref_chaos <= 0:
-            return None, False
-        approx = abs((now - ref_ts) - window_s) > 0.2 * window_s
-        return (chaos_now / ref_chaos - 1.0) * 100.0, approx
-
-    def save(self) -> None:
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, separators=(",", ":"))
-            os.replace(tmp, self.path)
-        except OSError:
-            pass
+    for action, latin, code, keysyms, chars in EDIT_SHORTCUTS:
+        if keysym.lower() == latin:
+            return None
+        if keycode == code or keysym in keysyms or char in chars:
+            return action
+    return None
 
 
-def http_get_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def play_alert() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import winsound
+        winsound.PlaySound("SystemNotification", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:  # noqa: BLE001 - sound is best effort
+        pass
 
 
-def fetch_leagues() -> list[str]:
-    data = http_get_json(LEAGUES_URL)
-    return [entry["name"] for entry in data if "name" in entry]
-
-
-def pick_softcore_league(leagues: list[str]) -> str:
-    """First league that is neither hardcore nor permanent = current softcore challenge league."""
-    for name in leagues:
-        if name.lower().startswith("hardcore") or name in ("Standard", "Hardcore"):
-            continue
-        return name
-    return "Standard"
-
-
-def fetch_currency(league: str) -> tuple[dict[str, Item], float | None]:
-    data = http_get_json(CURRENCY_URL.format(league=urllib.parse.quote(league)))
-    meta = {it["id"]: it for it in data.get("items", [])}
-    core = data.get("core", {})
-    rate = core.get("rates", {}).get("divine")
-    divine_rate = 1.0 / float(rate) if rate else None
-
-    items: dict[str, Item] = {}
-    for raw in data.get("lines", []):
-        cid = raw.get("id")
-        if not cid:
-            continue
-        m = meta.get(cid, {})
-        change = (raw.get("sparkline") or {}).get("totalChange")
-        image = m.get("image", "")
-        key = f"{CURRENCY}:{cid}"
-        items[key] = Item(
-            key=key, category=CURRENCY, name=m.get("name", cid), sub="", group=m.get("category", "Other"),
-            chaos=float(raw.get("primaryValue") or 0.0),
-            change_7d=float(change) if change is not None else None,
-            icon_url=(image if image.startswith("http") else IMAGE_HOST + image) if image else "",
-        )
-    if divine_rate is None and f"{CURRENCY}:divine" in items:
-        divine_rate = items[f"{CURRENCY}:divine"].chaos
-    return items, divine_rate
-
-
-def fetch_uniques(league: str, category: str) -> dict[str, Item]:
-    data = http_get_json(ITEM_URL.format(league=urllib.parse.quote(league), type=category))
-    items: dict[str, Item] = {}
-    for raw in data.get("lines", []):
-        did = raw.get("detailsId")
-        if not did:
-            continue
-        bits = []
-        if raw.get("variant"):
-            bits.append(str(raw["variant"]))
-        links = raw.get("links")
-        if isinstance(links, int) and links >= 5:
-            bits.append(f"{links}L")
-        change = (raw.get("sparkLine") or {}).get("totalChange")
-        key = f"{category}:{did}"
-        items[key] = Item(
-            key=key, category=category, name=raw.get("name", did), sub=" · ".join(bits),
-            group=raw.get("baseType") or "", chaos=float(raw.get("chaosValue") or 0.0),
-            change_7d=float(change) if change is not None else None, icon_url=raw.get("icon") or "",
-        )
-    return items
-
-
-def download_icons(items: list[Item]) -> int:
-    """Download icons that are not cached yet. Returns how many were fetched. Runs in a worker thread."""
-    fetched = 0
-    os.makedirs(ICON_DIR, exist_ok=True)
-    for it in items:
-        if not it.icon_url or os.path.exists(it.icon_file):
-            continue
-        try:
-            req = urllib.request.Request(it.icon_url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                data = resp.read()
-            tmp = it.icon_file + ".part"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, it.icon_file)
-            fetched += 1
-        except (urllib.error.URLError, OSError):
-            continue
-    return fetched
-
-
-def fmt_num(v: float) -> str:
-    if v >= 10000:
-        return f"{v:,.0f}"
-    if v >= 100:
-        return f"{v:.0f}"
-    if v >= 10:
-        return f"{v:.1f}"
-    if v >= 1:
-        return f"{v:.2f}"
-    if v >= 0.01:
-        return f"{v:.3f}"
-    return f"{v:.4f}"
-
-
-def fmt_change(c: float | None, approx: bool = False) -> str:
-    if c is None:
-        return "—"
-    sign = "+" if c > 0 else ""
-    return f"{'~' if approx else ''}{sign}{c:.1f}%"
-
-
-def fmt_price(chaos: float, divine_rate: float | None, key: str) -> tuple[str, str]:
-    """Return (text, color). Prices above half a divine are shown in divines; Divine Orb itself in chaos."""
-    if key != f"{CURRENCY}:divine" and divine_rate and chaos >= divine_rate * 0.5:
-        return f"{fmt_num(chaos / divine_rate)} div", FG_DIVINE
-    return f"{fmt_num(chaos)} c", FG_ACCENT
-
-
-# Word-level abbreviations for unique variant labels, so the hint fits on the item's row.
-ABBREVIATIONS = {
-    "Requirements": "Req", "Requirement": "Req", "Level": "Lvl", "Physical": "Phys", "Elemental": "Ele",
-    "Lightning": "Light", "Projectiles": "Proj", "Projectile": "Proj", "Damage": "Dmg", "Resistances": "Res",
-    "Resistance": "Res", "Resist": "Res", "Duration": "Dur", "Reduction": "Red", "Recovery": "Rec",
-    "Multi": "Mult", "Chance": "Chc", "Maximum": "Max", "Minimum": "Min", "Intelligence": "Int",
-    "Strength": "Str", "Dexterity": "Dex", "Accuracy": "Acc", "Endurance": "End", "Evasion": "Eva",
-    "Suppressed": "Supp", "Suppress": "Supp", "Cooldown": "CD", "Movement": "Move", "Notables": "Not.",
-}
-SUB_MAX_CHARS = 22
-
-
-def abbreviate(text: str, limit: int = SUB_MAX_CHARS) -> str:
-    """Shorten a variant label word by word; cut with an ellipsis if it is still too long."""
-    if len(text) <= limit:
-        return text
-    short = re.sub(r"[A-Za-z]+", lambda m: ABBREVIATIONS.get(m.group(0), m.group(0)), text)
-    if len(short) > limit:
-        short = short[:limit - 1].rstrip(" ,") + "…"
-    return short
-
-
-def describe_error(e: Exception) -> str:
-    if isinstance(e, urllib.error.HTTPError):
-        return f"HTTP {e.code}"
-    if isinstance(e, urllib.error.URLError):
-        return f"network: {getattr(e, 'reason', e)}"
-    return f"{type(e).__name__}: {e}"
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
 class App:
     AUTO_LABEL = "Auto (current SC)"
 
@@ -395,6 +89,12 @@ class App:
         self.icons: dict[tuple[str, int], tk.PhotoImage] = {}
         self.cols = 1
         self.resize_job: str | None = None
+        # live search state
+        self.live = LiveManager(self.q)
+        self.live_status: dict[str, str] = {}
+        self.live_hits: list[Listing] = []
+        self.live_widgets: list[tk.Widget] = []
+        self.popup: tk.Toplevel | None = None
 
         root.title("PoeDeck")
         root.configure(bg=BG)
@@ -405,11 +105,13 @@ class App:
 
         self._setup_style()
         self._build()
+        self._setup_edit_shortcuts()
         root.bind("<F5>", lambda e: self.refresh_now())
         root.bind("<Control-comma>", lambda e: self.open_settings())
 
         self.root.after(100, self._poll_queue)
         self._start_fetch(initial=True)
+        self._apply_live()
 
     # -- style -------------------------------------------------------------------
     def _setup_style(self):
@@ -433,9 +135,41 @@ class App:
                   indicatorbackground=[("selected", BG_ROW), ("active", BG_ROW)])
         style.configure("Dark.TEntry", fieldbackground=BG_ROW, foreground=FG, insertcolor=FG,
                         bordercolor=BG_HEAD, lightcolor=BG_ROW, darkcolor=BG_ROW)
+        style.configure("Dark.TButton", background=BG_ROW, foreground=FG, bordercolor=BG_HEAD,
+                        lightcolor=BG_ROW, darkcolor=BG_ROW, focuscolor=BG_ROW, padding=(8, 2))
+        style.map("Dark.TButton", background=[("active", SCROLL)])
         style.configure("Vertical.TScrollbar", background=SCROLL, troughcolor=BG, arrowcolor=FG,
                         bordercolor=BG, lightcolor=SCROLL, darkcolor=SCROLL)
         style.map("Vertical.TScrollbar", background=[("active", "#4a5060")])
+
+    def _setup_edit_shortcuts(self):
+        """Layout-independent Ctrl+C/V/X/A and a right-click menu for every entry field (see edit_action)."""
+        def on_ctrl_key(event):
+            widget = event.widget
+            if not hasattr(widget, "winfo_class") or widget.winfo_class() not in EDITABLE_CLASSES:
+                return None
+            action = edit_action(event.keysym, event.keycode, event.char)
+            if action:
+                widget.event_generate(action)
+                return "break"
+            return None
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_ROW, fg=FG, activebackground=FG_ACCENT, activeforeground=BG,
+                       borderwidth=0)
+        for label, action in (("Cut", "<<Cut>>"), ("Copy", "<<Copy>>"), ("Paste", "<<Paste>>"),
+                              ("Select all", "<<SelectAll>>")):
+            menu.add_command(label=label, command=lambda a=action: self.root.focus_get() and
+                             self.root.focus_get().event_generate(a))
+
+        def on_right_click(event):
+            if hasattr(event.widget, "winfo_class") and event.widget.winfo_class() in EDITABLE_CLASSES:
+                event.widget.focus_set()
+                menu.tk_popup(event.x_root, event.y_root)
+                return "break"
+            return None
+
+        self.root.bind_all("<Control-KeyPress>", on_ctrl_key)
+        self.root.bind_all("<Button-3>", on_right_click)
 
     def _font(self, delta: int = 0, bold: bool = False):
         return ("Segoe UI", self.cfg.font_size + delta, "bold" if bold else "normal")
@@ -457,6 +191,9 @@ class App:
         self.status_var = tk.StringVar(value="loading…")
         tk.Label(head, textvariable=self.status_var, bg=BG_HEAD, fg=FG_DIM,
                  font=self._font(-4)).pack(side="right", padx=8)
+
+        # live panel sits at the bottom; packed before the body so the body takes the rest
+        self.live_panel = tk.Frame(self.root, bg=BG_HEAD, padx=8, pady=4)
 
         self.body = tk.Frame(self.root, bg=BG, padx=8, pady=6)
         self.body.pack(fill="both", expand=True)
@@ -565,7 +302,7 @@ class App:
                            bg=BG, fg=FG_DIVINE, font=self._font(-2, bold=True), anchor="w")
             lbl.grid(row=0, column=0, columnspan=cols, sticky="w", pady=(0, 6))
             self.row_widgets.append(lbl)
-        win_lbl = tk.Label(self.body, text=f"\u0394 {self.cfg.change_window}", bg=BG, fg=FG_DIM,
+        win_lbl = tk.Label(self.body, text=f"Δ {self.cfg.change_window}", bg=BG, fg=FG_DIM,
                            font=self._font(-4), anchor="e")
         win_lbl.grid(row=0, column=cols - 1, sticky="e", pady=(0, 6))
         self.row_widgets.append(win_lbl)
@@ -611,9 +348,9 @@ class App:
                      anchor="s").pack(side="left", fill="y", padx=(8, 4))
         self.row_widgets.append(cell)
 
-        price_txt, price_fg = fmt_price(item.chaos, snap.divine_rate, item.key)
-        price = tk.Label(frame, text=price_txt, bg=bg, fg=price_fg, font=self._font(bold=True),
-                         anchor="e", padx=6)
+        price_txt, in_div = fmt_price(item.chaos, snap.divine_rate, item.key)
+        price = tk.Label(frame, text=price_txt, bg=bg, fg=FG_DIVINE if in_div else FG_ACCENT,
+                         font=self._font(bold=True), anchor="e", padx=6)
         price.grid(row=r, column=2, sticky="nsew")
 
         ch, approx = self._change(snap, item)
@@ -683,55 +420,63 @@ class App:
         try:
             while True:
                 kind, payload = self.q.get_nowait()
-                if kind == "data":
-                    leagues, snap = payload
-                    if leagues:
-                        self.leagues = leagues
-                        self._refresh_league_box()
-                    # keep categories that were browsed but have no selection, so settings stay populated
-                    if self.snapshot and self.snapshot.league == snap.league:
-                        for cat, items in self.snapshot.items.items():
-                            if cat not in snap.items:
-                                snap.items[cat] = items
-                                snap.fetched[cat] = self.snapshot.fetched.get(cat, 0.0)
-                    self.snapshot = snap
-                    present = [it for it in (snap.get(k) for k in self.cfg.selected) if it is not None]
-                    self.history.record(snap.league, present, snap.updated_at)
-                    self.status_var.set(time.strftime("%H:%M", time.localtime(snap.updated_at)))
-                    self.fetching = False
-                    self._maybe_relayout(force=True)
-                    self._sync_settings_list()
-                    self._schedule_next()
-                elif kind == "error":
-                    stale = ""
-                    if self.snapshot:
-                        stale = " (showing " + time.strftime("%H:%M", time.localtime(self.snapshot.updated_at)) + ")"
-                    self.status_var.set(f"error: {payload}{stale}")
-                    self.fetching = False
-                    self._render()
-                    self._schedule_next()
-                elif kind == "category":
-                    league, cat, items = payload
-                    self.loading_categories.discard(cat)
-                    if self.snapshot and self.snapshot.league == league:
-                        self.snapshot.items[cat] = items
-                        self.snapshot.fetched[cat] = time.time()
-                        newly = [items[k] for k in self.cfg.selected if k in items]
-                        self.history.record(league, newly, self.snapshot.updated_at)
-                        self._maybe_relayout(force=True)
-                        self._sync_settings_list()
-                elif kind == "category_error":
-                    cat, msg = payload
-                    self.loading_categories.discard(cat)
-                    self.status_var.set(f"error: {msg}")
-                    self._sync_settings_list()
-                elif kind == "icons":
-                    self.icon_job_running = False
-                    if payload:
-                        self._render()
+                handler = getattr(self, f"_on_{kind}", None)
+                if handler:
+                    handler(payload)
         except queue.Empty:
             pass
         self.root.after(200, self._poll_queue)
+
+    def _on_data(self, payload):
+        leagues, snap = payload
+        if leagues:
+            self.leagues = leagues
+            self._refresh_league_box()
+        # keep categories that were browsed but have no selection, so settings stay populated
+        if self.snapshot and self.snapshot.league == snap.league:
+            for cat, items in self.snapshot.items.items():
+                if cat not in snap.items:
+                    snap.items[cat] = items
+                    snap.fetched[cat] = self.snapshot.fetched.get(cat, 0.0)
+        self.snapshot = snap
+        present = [it for it in (snap.get(k) for k in self.cfg.selected) if it is not None]
+        self.history.record(snap.league, present, snap.updated_at)
+        self.status_var.set(time.strftime("%H:%M", time.localtime(snap.updated_at)))
+        self.fetching = False
+        self._maybe_relayout(force=True)
+        self._sync_settings_list()
+        self._schedule_next()
+
+    def _on_error(self, payload):
+        stale = ""
+        if self.snapshot:
+            stale = " (showing " + time.strftime("%H:%M", time.localtime(self.snapshot.updated_at)) + ")"
+        self.status_var.set(f"error: {payload}{stale}")
+        self.fetching = False
+        self._render()
+        self._schedule_next()
+
+    def _on_category(self, payload):
+        league, cat, items = payload
+        self.loading_categories.discard(cat)
+        if self.snapshot and self.snapshot.league == league:
+            self.snapshot.items[cat] = items
+            self.snapshot.fetched[cat] = time.time()
+            newly = [items[k] for k in self.cfg.selected if k in items]
+            self.history.record(league, newly, self.snapshot.updated_at)
+            self._maybe_relayout(force=True)
+            self._sync_settings_list()
+
+    def _on_category_error(self, payload):
+        cat, msg = payload
+        self.loading_categories.discard(cat)
+        self.status_var.set(f"error: {msg}")
+        self._sync_settings_list()
+
+    def _on_icons(self, payload):
+        self.icon_job_running = False
+        if payload:
+            self._render()
 
     def _schedule_next(self):
         if self.timer_id:
@@ -758,6 +503,115 @@ class App:
         self._sync_settings_list()
         self.refresh_now()
 
+    # -- live searches: panel, popups ---------------------------------------------------
+    def _live_searches(self) -> list[LiveSearch]:
+        return [LiveSearch.from_dict(d) for d in self.cfg.live_searches]
+
+    def _apply_live(self):
+        searches = self._live_searches()
+        self.live.apply(self.cfg.poesessid.strip(), searches)
+        self._render_live()
+
+    def _on_live_status(self, payload):
+        key, text = payload
+        self.live_status[key] = text
+        self._render_live()
+        self._sync_settings_list()
+
+    def _on_live_listings(self, payload):
+        listings: list[Listing] = payload
+        known = {h.listing_id for h in self.live_hits}
+        fresh = [l for l in listings if l.listing_id not in known]
+        if not fresh:
+            return
+        self.live_hits = (fresh[::-1] + self.live_hits)[:LIVE_MAX_HITS]
+        self._render_live()
+        if self.cfg.live_sound:
+            play_alert()
+        if self.cfg.live_popup:
+            self._show_popup(fresh[-1], extra=len(fresh) - 1)
+
+    def _render_live(self):
+        for w in self.live_widgets:
+            w.destroy()
+        self.live_widgets.clear()
+        searches = [s for s in self._live_searches() if s.enabled]
+        if not searches:
+            self.live_panel.pack_forget()
+            return
+        if not self.live_panel.winfo_ismapped():
+            self.body.pack_forget()
+            self.live_panel.pack(side="bottom", fill="x")
+            self.body.pack(fill="both", expand=True)
+
+        head = tk.Frame(self.live_panel, bg=BG_HEAD)
+        head.pack(fill="x")
+        self.live_widgets.append(head)
+        tk.Label(head, text="Live", bg=BG_HEAD, fg=FG_ACCENT, font=self._font(-3, bold=True)).pack(side="left")
+        for s in searches:
+            status = self.live_status.get(s.key, "…")
+            ok = status == "connected"
+            color = FG_UP if ok else (FG_DOWN if ("fail" in status or "not" in status) else FG_DIM)
+            text = f"● {s.label}" if ok else f"● {s.label}: {status}"
+            lbl = tk.Label(head, text=text, bg=BG_HEAD, fg=color, font=self._font(-4), cursor="hand2")
+            lbl.pack(side="left", padx=(10, 0))
+            lbl.bind("<Button-1>", lambda e, url=s.page_url: webbrowser.open(url))
+
+        for i, hit in enumerate(self.live_hits):
+            self._live_row(hit, i)
+
+    def _live_row(self, hit: Listing, i: int):
+        bg = BG_ROW if i % 2 == 0 else BG_HEAD
+        row = tk.Frame(self.live_panel, bg=bg, cursor="hand2")
+        row.pack(fill="x", pady=(1, 0))
+        self.live_widgets.append(row)
+        when = time.strftime("%H:%M", time.localtime(hit.received))
+        parts = [
+            (when, FG_DIM, -4), (hit.search_label, FG_DIM, -4), (hit.name, FG, -2),
+            (hit.price, FG_ACCENT, -2, True), (hit.seller, FG_DIM, -4),
+            (hit.online, FG_UP if hit.online == "online" else FG_DIM, -4),
+        ]
+        for text, fg, delta, *bold in parts:
+            tk.Label(row, text=text, bg=bg, fg=fg, font=self._font(delta, bool(bold)), anchor="w",
+                     padx=6).pack(side="left")
+        row.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
+        for child in row.winfo_children():
+            child.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
+
+    def _copy_whisper(self, hit: Listing):
+        if hit.whisper:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(hit.whisper)
+            self.status_var.set("whisper copied")
+        else:
+            self.status_var.set("no whisper text in listing")
+        self.root.after(3000, lambda: self.snapshot and self.status_var.set(
+            time.strftime("%H:%M", time.localtime(self.snapshot.updated_at))))
+
+    def _show_popup(self, hit: Listing, extra: int = 0):
+        if self.popup and self.popup.winfo_exists():
+            self.popup.destroy()
+        win = tk.Toplevel(self.root)
+        self.popup = win
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=FG_ACCENT)
+        inner = tk.Frame(win, bg=BG_HEAD, padx=12, pady=8)
+        inner.pack(padx=1, pady=1)
+        title = hit.search_label + (f"  (+{extra} more)" if extra else "")
+        tk.Label(inner, text=title, bg=BG_HEAD, fg=FG_ACCENT, font=self._font(-3, bold=True), anchor="w").pack(fill="x")
+        tk.Label(inner, text=hit.name, bg=BG_HEAD, fg=FG, font=self._font(0), anchor="w").pack(fill="x")
+        tk.Label(inner, text=f"{hit.price}   ·   {hit.seller} ({hit.online})", bg=BG_HEAD, fg=FG_DIM,
+                 font=self._font(-3), anchor="w").pack(fill="x")
+        tk.Label(inner, text="click to copy whisper", bg=BG_HEAD, fg=FG_DIM, font=self._font(-5), anchor="e").pack(fill="x")
+        for w in (win, inner, *inner.winfo_children()):
+            w.bind("<Button-1>", lambda e, h=hit: (self._copy_whisper(h), win.destroy()))
+        win.update_idletasks()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"+{sw - w - 24}+{sh - h - 72}")
+        win.after(LIVE_POPUP_SECONDS * 1000, lambda: win.winfo_exists() and win.destroy())
+
     # -- settings window -------------------------------------------------------------------
     def open_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
@@ -773,14 +627,15 @@ class App:
         top = tk.Frame(win, bg=BG, padx=8, pady=8)
         top.pack(fill="x")
         self.category_var = tk.StringVar(value=CATEGORY_LABEL[CURRENCY])
-        cat_box = ttk.Combobox(top, textvariable=self.category_var, state="readonly", width=18,
-                               values=[label for _, label in CATEGORIES], font=self._font(-3))
+        cat_box = ttk.Combobox(top, textvariable=self.category_var, state="readonly", width=24,
+                               values=[label for _, label in CATEGORIES] + [LIVE_SETTINGS_LABEL],
+                               font=self._font(-3))
         cat_box.pack(side="left")
         cat_box.bind("<<ComboboxSelected>>", lambda e: self._on_category_changed())
         self.search_var = tk.StringVar()
-        ent = ttk.Entry(top, textvariable=self.search_var, style="Dark.TEntry", font=self._font(-3))
-        ent.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        ent.focus_set()
+        self.search_entry = ttk.Entry(top, textvariable=self.search_var, style="Dark.TEntry", font=self._font(-3))
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.search_entry.focus_set()
         self.search_var.trace_add("write", lambda *_: self._fill_settings_list())
 
         opts = tk.Frame(win, bg=BG, padx=8)
@@ -814,7 +669,8 @@ class App:
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
         self.list_frame = tk.Frame(self.canvas, bg=BG)
         self.list_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_window = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.list_window, width=e.width))
         self.canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -833,6 +689,8 @@ class App:
 
     def _current_category(self) -> str:
         label = self.category_var.get()
+        if label == LIVE_SETTINGS_LABEL:
+            return LIVE_SETTINGS
         for cat, lbl in CATEGORIES:
             if lbl == label:
                 return cat
@@ -841,7 +699,7 @@ class App:
     def _on_category_changed(self):
         self.search_var.set("")  # also triggers _fill_settings_list via the trace
         cat = self._current_category()
-        if self.snapshot and cat not in self.snapshot.items:
+        if cat != LIVE_SETTINGS and self.snapshot and cat not in self.snapshot.items:
             self._load_category(cat)
             self._fill_settings_list()
 
@@ -865,6 +723,7 @@ class App:
             self.cfg.show_icons = new_icons
             self.cfg.change_window = new_window
             self._maybe_relayout(force=True)
+            self._render_live()
         self.cfg.save()
         if not self.fetching:
             self._schedule_next()
@@ -873,24 +732,26 @@ class App:
         if self.settings_win and self.settings_win.winfo_exists():
             self._fill_settings_list()
 
+    def _hint(self, text: str):
+        tk.Label(self.list_frame, text=text, bg=BG, fg=FG_DIM, font=self._font(-3), wraplength=500,
+                 justify="left").pack(anchor="w", pady=6)
+
     def _fill_settings_list(self):
         if not (self.settings_win and self.settings_win.winfo_exists()):
             return
         for w in self.list_frame.winfo_children():
             w.destroy()
         self.canvas.yview_moveto(0)
-        snap = self.snapshot
         cat = self._current_category()
-
-        def hint(text):
-            tk.Label(self.list_frame, text=text, bg=BG, fg=FG_DIM, font=self._font(-3), wraplength=420,
-                     justify="left").pack(anchor="w", pady=6)
-
+        if cat == LIVE_SETTINGS:
+            self._fill_live_settings()
+            return
+        snap = self.snapshot
         if snap is None:
-            hint("The list appears after the first successful update.")
+            self._hint("The list appears after the first successful update.")
             return
         if cat not in snap.items:
-            hint("Loading…" if cat in self.loading_categories else "Not loaded. Re-select the category to retry.")
+            self._hint("Loading…" if cat in self.loading_categories else "Not loaded. Re-select the category to retry.")
             return
 
         query = self.search_var.get().strip().lower()
@@ -908,7 +769,7 @@ class App:
         cur_group = None
         for it in items:
             if shown >= MAX_LIST_ROWS:
-                hint(f"…{len(items) - shown} more. Type to narrow the list.")
+                self._hint(f"…{len(items) - shown} more. Type to narrow the list.")
                 break
             group = "Selected" if it.key in selected else (it.group if cat == CURRENCY else "By price")
             if group != cur_group:
@@ -928,7 +789,7 @@ class App:
                             command=lambda k=it.key, v=var: self._toggle(k, v.get())).pack(anchor="w", padx=4)
             shown += 1
         if shown == 0:
-            hint("No matches.")
+            self._hint("No matches.")
 
     def _toggle(self, key: str, on: bool):
         if on and key not in self.cfg.selected:
@@ -938,10 +799,123 @@ class App:
         self.cfg.save()
         self._maybe_relayout(force=True)
 
+    # -- settings: live searches -----------------------------------------------------------
+    def _fill_live_settings(self):
+        lf = self.list_frame
+
+        def section(text):
+            tk.Label(lf, text=text, bg=BG, fg=FG_ACCENT, font=self._font(-3, bold=True)).pack(anchor="w", pady=(8, 2))
+
+        section("Session")
+        self._hint("POESESSID cookie from pathofexile.com (browser dev tools → Cookies). It stays in config.json "
+                   "on this machine only and is sent to pathofexile.com exclusively.")
+        row = tk.Frame(lf, bg=BG)
+        row.pack(fill="x", padx=4)
+        self.sess_var = tk.StringVar(value=self.cfg.poesessid)
+        ent = ttk.Entry(row, textvariable=self.sess_var, style="Dark.TEntry", font=self._font(-3), show="•")
+        ent.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Apply", style="Dark.TButton", command=self._apply_session).pack(side="left", padx=(6, 0))
+
+        section(f"Searches ({sum(1 for s in self.cfg.live_searches if s.get('enabled', True))}/{MAX_LIVE_SEARCHES} active)")
+        self._hint("Paste a trade search URL (with or without /live), give it a short name, Add.")
+        add = tk.Frame(lf, bg=BG)
+        add.pack(fill="x", padx=4)
+        self.url_var = tk.StringVar()
+        self.label_var = tk.StringVar()
+        ttk.Entry(add, textvariable=self.url_var, style="Dark.TEntry", font=self._font(-3)).pack(side="left", fill="x", expand=True)
+        name_ent = ttk.Entry(add, textvariable=self.label_var, style="Dark.TEntry", font=self._font(-3), width=14)
+        name_ent.pack(side="left", padx=6)
+        ttk.Button(add, text="Add", style="Dark.TButton", command=self._add_live_search).pack(side="left")
+        self.live_error_var = tk.StringVar()
+        tk.Label(lf, textvariable=self.live_error_var, bg=BG, fg=FG_DOWN, font=self._font(-4)).pack(anchor="w", padx=4)
+
+        for i, d in enumerate(self.cfg.live_searches):
+            s = LiveSearch.from_dict(d)
+            r = tk.Frame(lf, bg=BG_ROW if i % 2 == 0 else BG)
+            r.pack(fill="x", padx=4, pady=1)
+            var = tk.BooleanVar(value=s.enabled)
+            ttk.Checkbutton(r, variable=var, style="Dark.TCheckbutton",
+                            command=lambda idx=i, v=var: self._toggle_live(idx, v.get())).pack(side="left")
+            lbl = tk.Label(r, text=s.label, bg=r["bg"], fg=FG, font=self._font(-2), anchor="w", cursor="hand2")
+            lbl.pack(side="left", padx=(2, 8))
+            lbl.bind("<Button-1>", lambda e, url=s.page_url: webbrowser.open(url))
+            tk.Label(r, text=s.league, bg=r["bg"], fg=FG_DIM, font=self._font(-4)).pack(side="left")
+            status = self.live_status.get(s.key, "…" if s.enabled else "off")
+            color = FG_UP if status == "connected" else (FG_DOWN if ("fail" in status or "not" in status) else FG_DIM)
+            tk.Label(r, text=status, bg=r["bg"], fg=color, font=self._font(-4), anchor="w").pack(side="left", padx=8)
+            rm = tk.Label(r, text="✕", bg=r["bg"], fg=FG_DIM, font=self._font(-2), cursor="hand2", padx=6)
+            rm.pack(side="right")
+            rm.bind("<Button-1>", lambda e, idx=i: self._remove_live(idx))
+        if not self.cfg.live_searches:
+            self._hint("No live searches yet.")
+
+        section("Alerts")
+        arow = tk.Frame(lf, bg=BG)
+        arow.pack(fill="x", padx=4)
+        self.sound_var = tk.BooleanVar(value=self.cfg.live_sound)
+        self.popup_var = tk.BooleanVar(value=self.cfg.live_popup)
+        ttk.Checkbutton(arow, text="Sound", variable=self.sound_var, style="Dark.TCheckbutton",
+                        command=self._apply_live_options).pack(side="left")
+        ttk.Checkbutton(arow, text="Popup", variable=self.popup_var, style="Dark.TCheckbutton",
+                        command=self._apply_live_options).pack(side="left", padx=(12, 0))
+        self._hint("Clicking a listing in the main window or the popup copies its whisper to the clipboard.")
+
+    def _apply_session(self):
+        self.cfg.poesessid = self.sess_var.get().strip()
+        self.cfg.save()
+        self._apply_live()
+        self._sync_settings_list()
+
+    def _add_live_search(self):
+        search = LiveSearch.from_url(self.url_var.get(), self.label_var.get())
+        if search is None:
+            self.live_error_var.set("Not a trade search URL (expected .../trade/search/<league>/<id>).")
+            return
+        if any(d.get("id") == search.id and d.get("league") == search.league for d in self.cfg.live_searches):
+            self.live_error_var.set("This search is already in the list.")
+            return
+        active = sum(1 for s in self.cfg.live_searches if s.get("enabled", True))
+        search.enabled = active < MAX_LIVE_SEARCHES
+        self.cfg.live_searches.append(search.to_dict())
+        self.cfg.save()
+        self.url_var.set("")
+        self.label_var.set("")
+        self.live_error_var.set("" if search.enabled else f"Added disabled: {MAX_LIVE_SEARCHES} searches already active.")
+        self._apply_live()
+        self._sync_settings_list()
+
+    def _toggle_live(self, idx: int, on: bool):
+        if idx >= len(self.cfg.live_searches):
+            return
+        active = sum(1 for i, s in enumerate(self.cfg.live_searches) if s.get("enabled", True) and i != idx)
+        if on and active >= MAX_LIVE_SEARCHES:
+            self.live_error_var.set(f"At most {MAX_LIVE_SEARCHES} searches can be active.")
+            self._sync_settings_list()
+            return
+        self.cfg.live_searches[idx]["enabled"] = on
+        self.cfg.save()
+        self._apply_live()
+        self._sync_settings_list()
+
+    def _remove_live(self, idx: int):
+        if idx < len(self.cfg.live_searches):
+            key = LiveSearch.from_dict(self.cfg.live_searches[idx]).key
+            del self.cfg.live_searches[idx]
+            self.live_status.pop(key, None)
+            self.cfg.save()
+            self._apply_live()
+            self._sync_settings_list()
+
+    def _apply_live_options(self):
+        self.cfg.live_sound = bool(self.sound_var.get())
+        self.cfg.live_popup = bool(self.popup_var.get())
+        self.cfg.save()
+
     # -- lifecycle --------------------------------------------------------------------------
     def on_close(self):
         self.cfg.geometry = self.root.geometry()
         self.cfg.save()
+        self.live.shutdown()
         self.root.destroy()
 
 
@@ -955,7 +929,3 @@ def main():
     root = tk.Tk()
     App(root)
     root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
