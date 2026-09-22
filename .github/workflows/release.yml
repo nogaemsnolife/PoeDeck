@@ -16,9 +16,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -76,7 +76,7 @@ jobs:
           sha256sum "PoeDeck-v$v-windows-x64.zip" > "PoeDeck-v$v-windows-x64.zip.sha256"
           ls -l
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: PoeDeck-windows-x64
           path: |
