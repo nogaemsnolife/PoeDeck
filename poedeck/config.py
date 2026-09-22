@@ -52,6 +52,7 @@ HISTORY_MIN_GAP_S = 4 * 60       # do not store points closer than this (manual 
 MAX_LIST_ROWS = 200      # settings list cap; uniques categories have ~900 entries
 MAX_LIVE_SEARCHES = 5    # simultaneous trade live searches (GGG limits these per account)
 LIVE_MAX_HITS = 8        # listings kept in the live panel
+LIVE_HIT_TTL_S = 10 * 60 # listings disappear from the panel after this long
 LIVE_POPUP_SECONDS = 8
 
 

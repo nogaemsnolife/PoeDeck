@@ -363,28 +363,33 @@ def parse_listing(entry: dict, search: LiveSearch) -> Listing:
     )
 
 
-def travel_to_hideout(token: str, session_id: str) -> str:
+def travel_to_hideout(token: str, session_id: str, search: LiveSearch | None = None) -> str:
     """Ask the trade site to move the player's character to the seller's hideout (user-initiated only).
 
-    Returns a short status text. Requires HIDEOUT_TRAVEL_URL to be known.
+    Returns a short status text. Requires HIDEOUT_TRAVEL_URL to be known. The X-Requested-With header
+    marks the request as the site's own XHR; without it GGG answers 403 Forbidden.
     """
     if not HIDEOUT_TRAVEL_URL:
         return "travel endpoint not configured"
     body = json.dumps({"token": token}).encode("utf-8")
+    extra = {"Content-Type": "application/json", "Accept": "*/*", "X-Requested-With": "XMLHttpRequest",
+             "Referer": search.page_url if search else f"{TRADE_ORIGIN}/trade"}
     req = urllib.request.Request(HIDEOUT_TRAVEL_URL, data=body, method="POST",
-                                 headers=_trade_headers(session_id, {"Content-Type": "application/json",
-                                                                     "Accept": "application/json"}))
+                                 headers=_trade_headers(session_id, extra))
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            log.info("travel: HTTP %s", resp.status)
+            payload = resp.read().decode("utf-8", "replace")
+            log.info("travel: HTTP %s %s", resp.status, payload[:200])
             return "travelling…"
     except urllib.error.HTTPError as e:
         detail = ""
         try:
-            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+            raw = e.read().decode("utf-8", "replace")
+            detail = json.loads(raw).get("error", {}).get("message", "") or raw[:200]
         except Exception:  # noqa: BLE001
             pass
-        log.warning("travel: HTTP %s %s", e.code, detail)
+        log.warning("travel: HTTP %s %s | response headers: %s", e.code, detail,
+                    {k: v for k, v in e.headers.items() if k.lower().startswith(("x-rate", "cf-", "server"))})
         return f"travel failed: {detail or e.code}"
     except OSError as e:
         return f"travel failed: {e}"

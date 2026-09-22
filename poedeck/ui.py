@@ -16,8 +16,8 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 from .config import (AUTO_LEAGUE, CATEGORIES, CATEGORY_LABEL, CHANGE_LABEL, CHANGE_SECONDS, CHANGE_WINDOWS,
-                     CURRENCY, HISTORY_PATH, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, LOG_PATH, MAX_LIST_ROWS,
-                     MAX_LIVE_SEARCHES, Config)
+                     CURRENCY, HISTORY_PATH, LIVE_HIT_TTL_S, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, LOG_PATH,
+                     MAX_LIST_ROWS, MAX_LIVE_SEARCHES, Config)
 from .format import abbreviate, fmt_change, fmt_num, fmt_price
 from .ninja import (History, Item, Snapshot, describe_error, download_icons, fetch_currency, fetch_leagues,
                     fetch_uniques, pick_softcore_league)
@@ -117,6 +117,7 @@ class App:
         root.bind("<Control-comma>", lambda e: self.open_settings())
 
         self.root.after(100, self._poll_queue)
+        self.root.after(30_000, self._purge_hits)
         self._start_fetch(initial=True)
         self._apply_live()
 
@@ -571,6 +572,10 @@ class App:
             lbl = tk.Label(head, text=text, bg=BG_HEAD, fg=color, font=self._font(-4), cursor="hand2")
             lbl.pack(side="left", padx=(10, 0))
             lbl.bind("<Button-1>", lambda e, url=s.page_url: webbrowser.open(url))
+        if self.live_hits:
+            clear = tk.Label(head, text="clear", bg=BG_HEAD, fg=FG_DIM, font=self._font(-4), cursor="hand2")
+            clear.pack(side="right")
+            clear.bind("<Button-1>", lambda e: self._clear_hits())
 
         for i, hit in enumerate(self.live_hits):
             self._live_row(hit, i)
@@ -592,6 +597,9 @@ class App:
         for text, fg, delta, *bold in parts:
             tk.Label(row, text=text, bg=bg, fg=fg, font=self._font(delta, bool(bold)), anchor="w",
                      padx=6).pack(side="left")
+        close = tk.Label(row, text="\u2715", bg=bg, fg=FG_DIM, font=self._font(-3), cursor="hand2", padx=8)
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e, h=hit: self._dismiss_hit(h))
         if hit.hideout_token and HIDEOUT_TRAVEL_URL:
             btn = tk.Label(row, text="\u2302 Travel", bg=bg, fg=FG_ACCENT, font=self._font(-3, True),
                            cursor="hand2", padx=8)
@@ -601,10 +609,27 @@ class App:
             row.configure(cursor="hand2")
             row.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
             for child in row.winfo_children():
-                if child.cget("text") != "\u2302 Travel":
+                if child.cget("text") not in ("\u2302 Travel", "\u2715"):
                     child.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
         else:
             row.configure(cursor="")
+
+    def _dismiss_hit(self, hit: Listing):
+        self.live_hits = [h for h in self.live_hits if h.listing_id != hit.listing_id]
+        self._render_live()
+
+    def _clear_hits(self):
+        self.live_hits.clear()
+        self._render_live()
+
+    def _purge_hits(self):
+        """Drop listings older than LIVE_HIT_TTL_S from the panel."""
+        cutoff = time.time() - LIVE_HIT_TTL_S
+        kept = [h for h in self.live_hits if h.received >= cutoff]
+        if len(kept) != len(self.live_hits):
+            self.live_hits = kept
+            self._render_live()
+        self.root.after(30_000, self._purge_hits)
 
     def _flash_status(self, text: str, seconds: int = 3):
         self.status_var.set(text)
@@ -626,8 +651,9 @@ class App:
             self._flash_status("POESESSID not set")
             return
         self._flash_status("travelling…")
-        threading.Thread(target=lambda: self.q.put(("live_flash", travel_to_hideout(hit.hideout_token, session_id))),
-                         daemon=True).start()
+        search = next((s for s in self._live_searches() if s.key == hit.search_key), None)
+        threading.Thread(target=lambda: self.q.put(("live_flash", travel_to_hideout(hit.hideout_token, session_id,
+                                                                                    search))), daemon=True).start()
 
     def _on_live_flash(self, payload):
         self._flash_status(str(payload), 5)
