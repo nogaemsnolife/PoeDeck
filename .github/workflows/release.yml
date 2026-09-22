@@ -1,8 +1,12 @@
 name: Release
 
-# Push a tag like v0.4.0 to build a standalone Windows executable with Nuitka and
-# publish it on the GitHub release for that tag. "workflow_dispatch" builds the
-# same package as a downloadable artifact without creating a release.
+# Push a tag like v0.4.0 to build a Windows executable with Nuitka and publish it on
+# the GitHub release for that tag. "workflow_dispatch" builds the same package as a
+# downloadable artifact without creating a release.
+#
+# The build is --standalone (exe plus DLLs in a folder), not --onefile: a onefile
+# bootstrap unpacks a compressed payload to %TEMP% at start, which Defender's ML
+# heuristics flag as Trojan:Win32/Wacatac.B!ml on unsigned binaries.
 
 on:
   push:
@@ -42,7 +46,7 @@ jobs:
         shell: bash
         run: |
           python -m nuitka main.py \
-            --onefile \
+            --standalone \
             --assume-yes-for-downloads \
             --windows-console-mode=disable \
             --enable-plugin=tk-inter \
@@ -60,18 +64,24 @@ jobs:
         shell: bash
         run: |
           # start it, give it a few seconds, make sure the process is alive, then stop it
-          ./build/PoeDeck.exe & pid=$!
+          ./build/main.dist/PoeDeck.exe & pid=$!
           sleep 8
           if ! kill -0 $pid 2>/dev/null; then echo "::error::PoeDeck.exe exited early"; exit 1; fi
           kill $pid || true
-          test -f build/poedeck.log && cat build/poedeck.log || echo "(no log written next to exe)"
+          sleep 1
+          # the app must have created its data files next to the exe
+          ls build/main.dist | grep -E "poedeck.log|config.json" || { echo "::error::no data files next to exe"; exit 1; }
+          cat build/main.dist/poedeck.log
+          rm -f build/main.dist/poedeck.log build/main.dist/config.json build/main.dist/history.json
+          rm -rf build/main.dist/icons
 
       - name: Package
         shell: bash
         run: |
           v="${{ steps.ver.outputs.version }}"
-          mkdir -p dist/PoeDeck
-          cp build/PoeDeck.exe README.md LICENSE dist/PoeDeck/
+          mkdir -p dist
+          cp -r build/main.dist dist/PoeDeck
+          cp README.md LICENSE dist/PoeDeck/
           cd dist && 7z a -tzip "PoeDeck-v$v-windows-x64.zip" PoeDeck >/dev/null
           sha256sum "PoeDeck-v$v-windows-x64.zip" > "PoeDeck-v$v-windows-x64.zip.sha256"
           ls -l

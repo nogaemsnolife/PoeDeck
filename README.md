@@ -14,7 +14,13 @@ version unpacked over the old one keeps your settings. If that folder is read-on
 Files), data goes to `%LOCALAPPDATA%\PoeDeck` instead.
 
 The executable is not code-signed, so Windows SmartScreen warns on first launch: choose
-"More info" → "Run anyway".
+"More info" → "Run anyway". Keep `PoeDeck.exe` together with the DLLs in its folder.
+
+Antivirus note: builds are done by GitHub Actions from this repository (see
+`.github/workflows/release.yml`) with Nuitka in standalone mode, i.e. no self-extracting
+archive, which keeps machine-learning heuristics such as `Trojan:Win32/Wacatac.B!ml` from
+misfiring. If your scanner still complains, compare the zip's SHA-256 with the `.sha256` file
+on the release and, if in doubt, run from source.
 
 ## Run from source
 
