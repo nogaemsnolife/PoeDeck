@@ -1,0 +1,13 @@
+# per-user state created at runtime
+config.json
+icons/
+*.part
+
+# python
+__pycache__/
+*.pyc
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
