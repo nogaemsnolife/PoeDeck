@@ -25,16 +25,15 @@ def is_frozen() -> bool:
 def executable_dir() -> str | None:
     """Directory of the packaged executable, or None from source.
 
-    Nuitka onefile: sys.executable is the python.exe extracted to a temp folder, so the real
-    location comes from __compiled__.containing_dir / NUITKA_ONEFILE_DIRECTORY. PyInstaller
-    onefile: sys.executable is the bundle itself.
+    Nuitka: sys.executable is the bundled python.exe (in %TEMP% for onefile) and
+    __compiled__.containing_dir is the *parent* of the dist folder in standalone mode, so the
+    reliable answer is __compiled__.original_argv0, the path the user launched (measured on
+    Nuitka 4.2 in both modes). PyInstaller onefile: sys.executable is the bundle itself.
     """
     info = _nuitka_info()
     if info is not None:
-        d = getattr(info, "containing_dir", None) or os.environ.get("NUITKA_ONEFILE_DIRECTORY")
-        if d:
-            return os.path.abspath(d)
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
+        exe = getattr(info, "original_argv0", None) or (sys.argv[0] if sys.argv else "") or sys.executable
+        return os.path.dirname(os.path.abspath(exe))
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return None
