@@ -1,6 +1,9 @@
 """tkinter user interface: main dashboard window, settings window, live-search panel and popups."""
 from __future__ import annotations
 
+import collections
+import logging
+import logging.handlers
 import math
 import os
 import queue
@@ -13,12 +16,12 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 from .config import (AUTO_LEAGUE, CATEGORIES, CATEGORY_LABEL, CHANGE_LABEL, CHANGE_SECONDS, CHANGE_WINDOWS,
-                     CURRENCY, HISTORY_PATH, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, MAX_LIST_ROWS, MAX_LIVE_SEARCHES,
-                     Config)
+                     CURRENCY, HISTORY_PATH, LIVE_MAX_HITS, LIVE_POPUP_SECONDS, LOG_PATH, MAX_LIST_ROWS,
+                     MAX_LIVE_SEARCHES, Config)
 from .format import abbreviate, fmt_change, fmt_num, fmt_price
 from .ninja import (History, Item, Snapshot, describe_error, download_icons, fetch_currency, fetch_leagues,
                     fetch_uniques, pick_softcore_league)
-from .trade import Listing, LiveManager, LiveSearch
+from .trade import HIDEOUT_TRAVEL_URL, Listing, LiveManager, LiveSearch, travel_to_hideout
 
 # Dark palette
 BG = "#15171c"
@@ -31,6 +34,8 @@ FG_UP = "#5fbf7a"
 FG_DOWN = "#e06c6c"
 FG_DIVINE = "#8fc1ff"
 SCROLL = "#3a3f4b"
+
+log = logging.getLogger("poedeck.ui")
 
 LIVE_SETTINGS = "__live__"   # pseudo-category in the settings dropdown
 LIVE_SETTINGS_LABEL = "Live searches (trade site)"
@@ -93,8 +98,10 @@ class App:
         self.live = LiveManager(self.q)
         self.live_status: dict[str, str] = {}
         self.live_hits: list[Listing] = []
+        self.live_seen: "collections.deque[str]" = collections.deque(maxlen=1000)  # listing ids already shown
         self.live_widgets: list[tk.Widget] = []
         self.popup: tk.Toplevel | None = None
+        self.last_alert_at = 0.0
 
         root.title("PoeDeck")
         root.configure(bg=BG)
@@ -520,14 +527,22 @@ class App:
 
     def _on_live_listings(self, payload):
         listings: list[Listing] = payload
-        known = {h.listing_id for h in self.live_hits}
-        fresh = [l for l in listings if l.listing_id not in known]
+        known = set(self.live_seen)
+        fresh = []
+        for l in listings:
+            if l.listing_id not in known:
+                known.add(l.listing_id)
+                self.live_seen.append(l.listing_id)
+                fresh.append(l)
+        log.info("ui: %d listings received, %d new", len(listings), len(fresh))
         if not fresh:
             return
         self.live_hits = (fresh[::-1] + self.live_hits)[:LIVE_MAX_HITS]
         self._render_live()
-        if self.cfg.live_sound:
-            play_alert()
+        now = time.time()
+        if self.cfg.live_sound and now - self.last_alert_at > 2.0:
+            play_alert()  # one sound per burst, the server delivers batches within a second
+        self.last_alert_at = now
         if self.cfg.live_popup:
             self._show_popup(fresh[-1], extra=len(fresh) - 1)
 
@@ -569,24 +584,53 @@ class App:
         parts = [
             (when, FG_DIM, -4), (hit.search_label, FG_DIM, -4), (hit.name, FG, -2),
             (hit.price, FG_ACCENT, -2, True), (hit.seller, FG_DIM, -4),
-            (hit.online, FG_UP if hit.online == "online" else FG_DIM, -4),
         ]
+        if hit.hideout_token and not hit.whisper:
+            parts.append(("NPC", FG_DIVINE, -4))  # sold by the seller's NPC; their online state is irrelevant
+        else:
+            parts.append((hit.online, FG_UP if hit.online == "online" else FG_DIM, -4))
         for text, fg, delta, *bold in parts:
             tk.Label(row, text=text, bg=bg, fg=fg, font=self._font(delta, bool(bold)), anchor="w",
                      padx=6).pack(side="left")
-        row.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
-        for child in row.winfo_children():
-            child.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
+        if hit.hideout_token and HIDEOUT_TRAVEL_URL:
+            btn = tk.Label(row, text="\u2302 Travel", bg=bg, fg=FG_ACCENT, font=self._font(-3, True),
+                           cursor="hand2", padx=8)
+            btn.pack(side="right")
+            btn.bind("<Button-1>", lambda e, h=hit: self._travel(h))
+        if hit.whisper:
+            row.configure(cursor="hand2")
+            row.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
+            for child in row.winfo_children():
+                if child.cget("text") != "\u2302 Travel":
+                    child.bind("<Button-1>", lambda e, h=hit: self._copy_whisper(h))
+        else:
+            row.configure(cursor="")
+
+    def _flash_status(self, text: str, seconds: int = 3):
+        self.status_var.set(text)
+        self.root.after(seconds * 1000, lambda: self.snapshot and self.status_var.set(
+            time.strftime("%H:%M", time.localtime(self.snapshot.updated_at))))
 
     def _copy_whisper(self, hit: Listing):
         if hit.whisper:
             self.root.clipboard_clear()
             self.root.clipboard_append(hit.whisper)
-            self.status_var.set("whisper copied")
+            self._flash_status("whisper copied")
         else:
-            self.status_var.set("no whisper text in listing")
-        self.root.after(3000, lambda: self.snapshot and self.status_var.set(
-            time.strftime("%H:%M", time.localtime(self.snapshot.updated_at))))
+            self._flash_status("NPC listing: no whisper, use Travel")
+
+    def _travel(self, hit: Listing):
+        """Explicit user click only; never called automatically."""
+        session_id = self.cfg.poesessid.strip()
+        if not session_id:
+            self._flash_status("POESESSID not set")
+            return
+        self._flash_status("travelling…")
+        threading.Thread(target=lambda: self.q.put(("live_flash", travel_to_hideout(hit.hideout_token, session_id))),
+                         daemon=True).start()
+
+    def _on_live_flash(self, payload):
+        self._flash_status(str(payload), 5)
 
     def _show_popup(self, hit: Listing, extra: int = 0):
         if self.popup and self.popup.winfo_exists():
@@ -601,11 +645,14 @@ class App:
         title = hit.search_label + (f"  (+{extra} more)" if extra else "")
         tk.Label(inner, text=title, bg=BG_HEAD, fg=FG_ACCENT, font=self._font(-3, bold=True), anchor="w").pack(fill="x")
         tk.Label(inner, text=hit.name, bg=BG_HEAD, fg=FG, font=self._font(0), anchor="w").pack(fill="x")
-        tk.Label(inner, text=f"{hit.price}   ·   {hit.seller} ({hit.online})", bg=BG_HEAD, fg=FG_DIM,
+        seller = hit.seller if hit.hideout_token and not hit.whisper else f"{hit.seller} ({hit.online})"
+        tk.Label(inner, text=f"{hit.price}   ·   {seller}", bg=BG_HEAD, fg=FG_DIM,
                  font=self._font(-3), anchor="w").pack(fill="x")
-        tk.Label(inner, text="click to copy whisper", bg=BG_HEAD, fg=FG_DIM, font=self._font(-5), anchor="e").pack(fill="x")
+        hint = "click to copy whisper" if hit.whisper else ("NPC listing — use Travel in the Live panel"
+                                                          if hit.hideout_token else "click to close")
+        tk.Label(inner, text=hint, bg=BG_HEAD, fg=FG_DIM, font=self._font(-5), anchor="e").pack(fill="x")
         for w in (win, inner, *inner.winfo_children()):
-            w.bind("<Button-1>", lambda e, h=hit: (self._copy_whisper(h), win.destroy()))
+            w.bind("<Button-1>", lambda e, h=hit: (hit.whisper and self._copy_whisper(h), win.destroy()))
         win.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
@@ -919,7 +966,15 @@ class App:
         self.root.destroy()
 
 
+def setup_logging():
+    handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger("poedeck").setLevel(logging.INFO)
+    logging.getLogger("poedeck").addHandler(handler)
+
+
 def main():
+    setup_logging()
     if sys.platform == "win32":
         try:
             import ctypes

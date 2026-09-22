@@ -15,3 +15,6 @@ Thumbs.db
 # local price history (per user)
 history.json
 history.json.tmp
+
+# runtime log
+poedeck.log*

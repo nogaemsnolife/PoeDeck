@@ -1,7 +1,9 @@
 """Official trade site live search.
 
-A live search is a WebSocket the trade site opens for a saved search; the server pushes the
-ids of new listings, and their details are then fetched over plain HTTP. Both need the user's
+A live search is a WebSocket the trade site opens for a saved search. For every new listing the
+server pushes a short-lived signed token ({"result": "<JWT>", "count": n}; older servers sent
+{"new": [ids]}), which is then exchanged for the listing details over plain HTTP:
+GET /api/trade/fetch/<token or comma-separated ids>?query=<search id>. Both need the user's
 POESESSID cookie. Everything here runs in worker threads and reports to the UI through a queue:
 
     ("live_status",   (search_key, text))
@@ -15,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -30,16 +33,25 @@ from dataclasses import dataclass, field
 
 from .config import HTTP_TIMEOUT, MAX_LIVE_SEARCHES, USER_AGENT
 
+log = logging.getLogger("poedeck.trade")
+
 TRADE_HOST = "www.pathofexile.com"
 TRADE_ORIGIN = f"https://{TRADE_HOST}"
 LIVE_PATH = "/api/trade/live/{league}/{search_id}"
-FETCH_URL = f"{TRADE_ORIGIN}/api/trade/fetch/{{ids}}?query={{search_id}}"
+FETCH_URL = f"{TRADE_ORIGIN}/api/trade/fetch/{{what}}?query={{search_id}}"
 SEARCH_PAGE_URL = f"{TRADE_ORIGIN}/trade/search/{{league}}/{{search_id}}"
+# NPC-market listings carry a hideout_token instead of a whisper. The trade site's "Travel to Hideout"
+# button posts {"token": hideout_token} to the whisper endpoint (policy trade-whisper-request-limit,
+# 15 requests per minute per account). Set to None to hide the Travel button.
+HIDEOUT_TRAVEL_URL: str | None = f"{TRADE_ORIGIN}/api/trade/whisper"
 SEARCH_URL_RE = re.compile(r"pathofexile\.com/trade/search/(?P<league>[^/?#]+)/(?P<id>[^/?#]+)")
 
 FETCH_BATCH = 10            # ids per fetch request (server maximum)
 FETCH_MIN_INTERVAL_S = 1.0  # spacing between fetch requests on top of the server's rate limit headers
-IDLE_PING_S = 30            # send a ping after this much silence
+RECV_TIMEOUT_S = 30         # how often the reader wakes up to check for shutdown
+SILENCE_RECONNECT_S = 300   # no frame at all (not even a server ping) for this long -> reconnect
+# Note: the client never sends WebSocket pings. Browsers cannot, and the trade server answers
+# unexpected control frames by closing the connection with 1008 (policy violation).
 RECONNECT_MIN_S = 5
 RECONNECT_MAX_S = 120
 
@@ -89,8 +101,9 @@ class Listing:
     seller: str
     online: str          # "online", "afk", "offline" or "" when unknown
     whisper: str         # ready-to-paste whisper text; empty when the API did not include it
-    hideout_token: str   # present for NPC-market listings when logged in; unused for now
+    hideout_token: str   # NPC-market listings (no whisper): token for "Travel to Hideout"
     indexed: str
+    fee: int = 0         # NPC-market listing fee reported by the API
     received: float = field(default_factory=time.time)
 
 
@@ -108,15 +121,19 @@ class WebSocket:
 
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def __init__(self, timeout: float = IDLE_PING_S):
+    def __init__(self, timeout: float = RECV_TIMEOUT_S):
         self.timeout = timeout
         self.sock: ssl.SSLSocket | None = None
         self.buf = b""
         self.send_lock = threading.Lock()
+        self.last_frame_at = 0.0
 
     def connect(self, host: str, path: str, headers: dict[str, str]) -> None:
         ctx = ssl.create_default_context()
         raw = socket.create_connection((host, 443), timeout=HTTP_TIMEOUT)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows: probe after 60s idle, every 10s
+            raw.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60_000, 10_000))
         self.sock = ctx.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
         lines = [f"GET {path} HTTP/1.1", f"Host: {host}", "Upgrade: websocket", "Connection: Upgrade",
@@ -138,6 +155,7 @@ class WebSocket:
         status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         if status != 101:
             reason = parts[2] if len(parts) > 2 else ""
+            log.warning("handshake %s -> HTTP %s %s", path[:60], status, reason)
             raise WebSocketError(f"HTTP {status} {reason}".strip(), status=status)
         accept = next((l.split(":", 1)[1].strip() for l in header_lines[1:]
                        if l.lower().startswith("sec-websocket-accept:")), "")
@@ -145,6 +163,7 @@ class WebSocket:
         if accept != expected:
             raise WebSocketError("bad Sec-WebSocket-Accept")
         self.buf = rest
+        self.last_frame_at = time.time()
         self.sock.settimeout(self.timeout)
 
     # -- receiving ---------------------------------------------------------------
@@ -178,6 +197,7 @@ class WebSocket:
         self._fill(offset + length)
         payload = self.buf[offset:offset + length]
         self.buf = self.buf[offset + length:]
+        self.last_frame_at = time.time()
         if mask:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         return fin, opcode, payload
@@ -222,8 +242,8 @@ class WebSocket:
         with self.send_lock:
             self.sock.sendall(header + mask + masked)
 
-    def ping(self) -> None:
-        self._send_frame(0x9, b"poedeck")
+    def silent_for(self) -> float:
+        return time.time() - self.last_frame_at
 
     def close(self) -> None:
         if self.sock is None:
@@ -339,15 +359,47 @@ def parse_listing(entry: dict, search: LiveSearch) -> Listing:
         name=full_name or "item", price=price_text, seller=str(account.get("name", "")),
         online=_online_text(account), whisper=str(li.get("whisper") or ""),
         hideout_token=str(li.get("hideout_token") or ""), indexed=str(li.get("indexed") or ""),
+        fee=int(li.get("fee") or 0),
     )
 
 
-def fetch_listings(ids: list[str], search: LiveSearch, session_id: str, limiter: RateLimiter) -> list[Listing]:
-    """Fetch listing details in batches of FETCH_BATCH, honouring the rate limit. Raises on HTTP errors."""
+def travel_to_hideout(token: str, session_id: str) -> str:
+    """Ask the trade site to move the player's character to the seller's hideout (user-initiated only).
+
+    Returns a short status text. Requires HIDEOUT_TRAVEL_URL to be known.
+    """
+    if not HIDEOUT_TRAVEL_URL:
+        return "travel endpoint not configured"
+    body = json.dumps({"token": token}).encode("utf-8")
+    req = urllib.request.Request(HIDEOUT_TRAVEL_URL, data=body, method="POST",
+                                 headers=_trade_headers(session_id, {"Content-Type": "application/json",
+                                                                     "Accept": "application/json"}))
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            log.info("travel: HTTP %s", resp.status)
+            return "travelling…"
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("travel: HTTP %s %s", e.code, detail)
+        return f"travel failed: {detail or e.code}"
+    except OSError as e:
+        return f"travel failed: {e}"
+
+
+def fetch_listings(what: "str | list[str]", search: LiveSearch, session_id: str,
+                   limiter: RateLimiter) -> list[Listing]:
+    """Fetch listing details for a live-search token (str) or listing ids (list), honouring the rate limit.
+
+    Tokens expire within minutes, so callers should fetch promptly. Raises on HTTP errors.
+    """
     out: list[Listing] = []
-    for i in range(0, len(ids), FETCH_BATCH):
-        batch = ids[i:i + FETCH_BATCH]
-        url = FETCH_URL.format(ids=",".join(batch), search_id=search.id)
+    batches = [what] if isinstance(what, str) else [what[i:i + FETCH_BATCH] for i in range(0, len(what), FETCH_BATCH)]
+    for batch in batches:
+        url = FETCH_URL.format(what=batch if isinstance(batch, str) else ",".join(batch), search_id=search.id)
         req = urllib.request.Request(url, headers=_trade_headers(session_id, {"Accept": "application/json"}))
         for attempt in range(2):
             limiter.wait()
@@ -363,9 +415,21 @@ def fetch_listings(ids: list[str], search: LiveSearch, session_id: str, limiter:
                     limiter.penalize(float(retry) if retry.replace(".", "", 1).isdigit() else 60.0)
                     continue
                 raise
-        for entry in data.get("result") or []:
-            if entry:
+        results = data.get("result") or []
+        log.info("fetch %s: %s -> %d results", search.label,
+                 "token" if isinstance(batch, str) else f"{len(batch)} ids", len(results))
+        for entry in results:
+            if not entry:
+                continue
+            if not out:
+                li = entry.get("listing") or {}
+                log.info("listing fields: whisper=%s whisper_token=%s hideout_token=%s keys=%s",
+                         bool(li.get("whisper")), bool(li.get("whisper_token")), bool(li.get("hideout_token")),
+                         sorted(li.keys()))
+            try:
                 out.append(parse_listing(entry, search))
+            except Exception:  # noqa: BLE001 - one odd listing must not lose the batch
+                log.exception("cannot parse listing: %s", json.dumps(entry)[:500])
     return out
 
 
@@ -395,23 +459,27 @@ class LiveSearchWorker(threading.Thread):
     def run(self) -> None:
         delay = RECONNECT_MIN_S
         while not self.stop_event.is_set():
-            ws = WebSocket(timeout=IDLE_PING_S)
+            ws = WebSocket()
             self.ws = ws
             try:
                 self._status("connecting…")
                 path = LIVE_PATH.format(league=urllib.parse.quote(self.search.league), search_id=self.search.id)
                 ws.connect(TRADE_HOST, path, _trade_headers(self.session_id))
+                log.info("live %s: connected", self.search.label)
                 self._status("connected")
                 delay = RECONNECT_MIN_S
                 while not self.stop_event.is_set():
                     msg = ws.recv_text()
                     if msg is None:
-                        ws.ping()
+                        if ws.silent_for() > SILENCE_RECONNECT_S:
+                            raise WebSocketError(f"no traffic for {SILENCE_RECONNECT_S // 60} min")
                         continue
+                    log.info("live %s: message %s", self.search.label, msg[:4000])
                     self._handle(msg)
             except WebSocketError as e:
                 if self.stop_event.is_set():
                     break
+                log.warning("live %s: %s", self.search.label, e)
                 if e.status in (401, 403):
                     self._status("auth failed — check POESESSID")
                     return
@@ -421,9 +489,10 @@ class LiveSearchWorker(threading.Thread):
                 if e.status == 429:
                     delay = max(delay, 60)
                 self._status(f"{e}; retry in {delay}s")
-            except (OSError, ValueError) as e:
+            except Exception as e:  # noqa: BLE001 - a worker must never die silently
                 if self.stop_event.is_set():
                     break
+                log.exception("live %s: unexpected error", self.search.label)
                 self._status(f"{type(e).__name__}: {e}; retry in {delay}s")
             finally:
                 ws.close()
@@ -438,9 +507,14 @@ class LiveSearchWorker(threading.Thread):
             return
         if not isinstance(data, dict):
             return
+        token = data.get("result")
         new_ids = data.get("new")
-        if isinstance(new_ids, list) and new_ids:
+        if isinstance(token, str) and token:
+            self.manager.enqueue_fetch(self.search, token)
+        elif isinstance(new_ids, list) and new_ids:
             self.manager.enqueue_fetch(self.search, [str(i) for i in new_ids])
+        elif "auth" not in data and "error" not in data:
+            log.warning("live %s: unrecognised message keys %s", self.search.label, list(data)[:10])
         err = data.get("error")
         if isinstance(err, dict):
             self._status(f"server: {err.get('message') or err.get('code')}")
@@ -453,7 +527,9 @@ class LiveManager:
         self.out = out
         self.workers: dict[str, LiveSearchWorker] = {}
         self.limiter = RateLimiter()
-        self.fetch_queue: "queue.Queue[tuple[LiveSearch, list[str]] | None]" = queue.Queue()
+        self.fetch_queue: "queue.Queue[tuple[LiveSearch, str | list[str]] | None]" = queue.Queue()
+        self.recent_tokens: dict[str, float] = {}   # token -> time enqueued; the server repeats tokens
+        self.recent_lock = threading.Lock()
         self.fetcher = threading.Thread(target=self._fetch_loop, daemon=True, name="live:fetch")
         self.fetcher.start()
 
@@ -480,26 +556,42 @@ class LiveManager:
             if not s.enabled:
                 self.out.put(("live_status", (s.key, "off")))
 
-    def enqueue_fetch(self, search: LiveSearch, ids: list[str]) -> None:
-        self.fetch_queue.put((search, ids))
+    def enqueue_fetch(self, search: LiveSearch, what: "str | list[str]") -> None:
+        if isinstance(what, str):
+            now = time.time()
+            with self.recent_lock:
+                for tok, ts in list(self.recent_tokens.items()):
+                    if now - ts > 600:
+                        del self.recent_tokens[tok]
+                if what in self.recent_tokens:
+                    return
+                self.recent_tokens[what] = now
+        self.fetch_queue.put((search, what))
 
     def _fetch_loop(self) -> None:
         while True:
             job = self.fetch_queue.get()
             if job is None:
                 return
-            search, ids = job
+            search, what = job
             worker = self.workers.get(search.key)
             session_id = worker.session_id if worker else ""
             if not session_id:
                 continue
             try:
-                listings = fetch_listings(ids, search, session_id, self.limiter)
+                listings = fetch_listings(what, search, session_id, self.limiter)
                 if listings:
                     self.out.put(("live_listings", listings))
             except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read()[:300].decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    pass
+                log.warning("fetch %s: HTTP %s %s", search.label, e.code, body)
                 self.out.put(("live_status", (search.key, f"fetch failed: HTTP {e.code}")))
-            except (OSError, ValueError) as e:
+            except Exception as e:  # noqa: BLE001 - the fetch thread must never die silently
+                log.exception("fetch %s: unexpected error", search.label)
                 self.out.put(("live_status", (search.key, f"fetch failed: {e}")))
 
     def shutdown(self) -> None:

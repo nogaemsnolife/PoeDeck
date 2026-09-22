@@ -9,6 +9,7 @@ APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_DIR = os.path.join(APP_DIR, "icons")
 HISTORY_PATH = os.path.join(APP_DIR, "history.json")
+LOG_PATH = os.path.join(APP_DIR, "poedeck.log")
 
 USER_AGENT = "PoeDeck/0.3 (github.com/nogaemsnolife/PoeDeck)"
 HTTP_TIMEOUT = 30

@@ -33,9 +33,11 @@ pythonw main.py
 - Configurable refresh interval, font size, always-on-top. Window size and position are remembered.
 - Hotkeys: `F5` refresh, `Ctrl+,` settings.
 - Trade site live searches (up to 5): paste a search URL, and new listings appear in a panel at the
-  bottom with a sound and a popup. Clicking a listing copies the whisper. Requires your `POESESSID`
-  cookie, entered in settings; it is stored only in your local `config.json` and sent only to
-  pathofexile.com.
+  bottom with a sound and a popup. Listings sold through the NPC market (the current default) are
+  tagged `NPC` and get a `Travel` button that asks the trade site to move your character to the
+  seller's hideout, exactly like the site's own button; it is never triggered automatically.
+  Listings with a whisper are copied to the clipboard on click. Requires your `POESESSID` cookie,
+  entered in settings; it is stored only in your local `config.json` and sent only to pathofexile.com.
 
 ## Files
 
@@ -49,6 +51,7 @@ pythonw main.py
 | `config.json` | created on first run; league, selected items, options, live searches, POESESSID |
 | `icons/` | cached item icons |
 | `history.json` | local price history for the 1h/6h/24h change windows (3 days retention) |
+| `poedeck.log` | runtime log (live search messages, fetch results, errors); no cookie or seller names |
 
 ## Notes
 
